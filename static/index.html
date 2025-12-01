@@ -109,10 +109,10 @@
                 const msg = JSON.parse(e.data);
                 console.log('Received:', msg);
 
-                if (msg.type === 'doc' && msg.lang === currentLang) {
+                if (msg.type === 'doc') {
                     editor.value = msg.text;
                     lastSentText = msg.text;
-                    pendingBlocks = {};  // Clear pending on full doc update
+                    pendingBlocks = {};
                 }
 
                 if (msg.type === 'clients') {
