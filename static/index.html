@@ -88,7 +88,7 @@
         let currentLang = 'en';
         let debounceTimer = null;
         let lastSentText = '';
-        let pendingBlocks = {};  // {index: {text, sourceLang}}
+        let receivingUpdate = false;  // Flag to prevent re-sending server pushes
 
         const connect = () => {
             ws = new WebSocket(`ws://${location.host}/ws`);
@@ -110,11 +110,12 @@
                 console.log('Received:', msg);
 
                 if (msg.type === 'doc') {
-                    // Clear any pending send to prevent loops
+                    // Prevent this update from triggering a re-send
                     clearTimeout(debounceTimer);
+                    receivingUpdate = true;
                     editor.value = msg.text;
                     lastSentText = msg.text;
-                    pendingBlocks = {};
+                    receivingUpdate = false;
                 }
 
                 if (msg.type === 'clients') {
@@ -135,11 +136,13 @@
 
         // Send update when user stops typing
         editor.addEventListener('input', () => {
+            if (receivingUpdate) return;  // Don't send if we're receiving a server push
+
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => {
                 const text = editor.value;
                 if (text !== lastSentText && ws?.readyState === WebSocket.OPEN) {
-                    console.log('Sending update');
+                    console.log('Sending update:', text.length, 'chars');
                     ws.send(JSON.stringify({
                         type: 'update',
                         lang: currentLang,

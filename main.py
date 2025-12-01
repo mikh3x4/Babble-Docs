@@ -29,9 +29,6 @@ LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 
 clients: dict[WebSocket, str] = {}
 
-# Track recent translations to prevent loops: {(block_idx, target_lang): translated_text}
-recent_translations: dict[tuple[int, str], str] = {}
-
 DOC_PATH = DOCS_DIR / "document.json"
 
 def load_doc() -> list:
@@ -191,13 +188,6 @@ async def websocket_endpoint(ws: WebSocket):
                 for i in range(max(len(old_contents), len(new_contents))):
                     old_text = old_contents[i].get(source_lang, "") if i < len(old_contents) else ""
                     new_text_i = new_contents[i].get(source_lang, "") if i < len(new_contents) else ""
-
-                    # Skip if this is a translation we just pushed (prevent loops)
-                    if (i, source_lang) in recent_translations:
-                        if recent_translations[(i, source_lang)] == new_text_i:
-                            logger.debug(f"Skipping block {i} - this is our own translation")
-                            continue
-
                     if old_text != new_text_i:
                         changed_indices.append(i)
 
@@ -261,15 +251,6 @@ async def websocket_endpoint(ws: WebSocket):
                             source_lang, target_lang
                         )
                         new_contents[idx][target_lang] = translated
-
-                        # Track this translation to prevent loops
-                        recent_translations[(idx, target_lang)] = translated
-
-                # Clean old entries from recent_translations (keep last 50)
-                if len(recent_translations) > 50:
-                    keys = list(recent_translations.keys())
-                    for k in keys[:-50]:
-                        del recent_translations[k]
 
                 save_doc(new_doc)
                 await send_doc_to_all(new_doc)
