@@ -108,23 +108,26 @@ def undo_last() -> dict | None:
     return previous["documents"]
 
 def split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Handles ., !, ? and Chinese punctuation.
+    """Split text into sentences. Handles ., newlines, and Chinese punctuation.
 
+    A sentence is anything separated by '.' or newline.
     Returns a list of sentences. Use split_sentences_with_separators() if you
     need to preserve original whitespace/formatting.
     """
     if not text.strip():
         logger.debug(f"split_sentences: empty text, returning []")
         return []
-    # Split on sentence-ending punctuation (ASCII and Chinese) followed by space or end
-    # Chinese punctuation: (full stop), (exclamation), (question mark)
-    parts = re.split(r'(?<=[.!?\u3002\uff01\uff1f])\s*', text.strip())
+    # Split on sentence-ending punctuation (ASCII and Chinese) OR newlines
+    # Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
+    parts = re.split(r'(?<=[.!?\u3002\uff01\uff1f])\s*|\n+', text.strip())
     result = [p for p in parts if p.strip()]
     logger.debug(f"split_sentences: {len(result)} sentences from {len(text)} chars")
     return result
 
 def split_sentences_with_separators(text: str) -> tuple[list[str], list[str]]:
     """Split text into sentences while preserving the separators between them.
+
+    A sentence is anything separated by '.' or newline.
 
     Returns:
         tuple of (sentences, separators) where separators[i] is the whitespace
@@ -134,33 +137,47 @@ def split_sentences_with_separators(text: str) -> tuple[list[str], list[str]]:
         logger.debug(f"split_sentences_with_separators: empty text, returning ([], [])")
         return [], []
 
-    # Use findall to capture both sentences and separators
-    # Pattern: sentence ending with .!? or Chinese punctuation, followed by optional whitespace
-    # Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
-    pattern = r'(.*?[.!?\u3002\uff01\uff1f])(\s*)'
-    matches = re.findall(pattern, text.strip(), re.DOTALL)
-
-    if not matches:
-        # No sentence-ending punctuation found, treat entire text as one sentence
-        stripped = text.strip()
-        if stripped:
-            return [stripped], ['']
-        return [], []
-
     sentences = []
     separators = []
 
-    for sentence, separator in matches:
-        sentence = sentence.strip()
-        if sentence:
-            sentences.append(sentence)
-            # Normalize separator: preserve paragraph breaks (2+ newlines), otherwise use space
-            if '\n\n' in separator or separator.count('\n') >= 2:
-                separators.append('\n\n')
-            elif separator:
-                separators.append(' ')
-            else:
-                separators.append('')
+    # Split by newlines first, then by sentence-ending punctuation within each line
+    # Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
+    lines = text.strip().split('\n')
+
+    for line_idx, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Pattern: sentence ending with .!? or Chinese punctuation, followed by optional whitespace
+        pattern = r'(.*?[.!?\u3002\uff01\uff1f])(\s*)'
+        matches = re.findall(pattern, line, re.DOTALL)
+
+        if matches:
+            for match_idx, (sentence, separator) in enumerate(matches):
+                sentence = sentence.strip()
+                if sentence:
+                    sentences.append(sentence)
+                    # Determine separator: if last match in line and not last line, use newline
+                    is_last_match_in_line = match_idx == len(matches) - 1
+                    is_last_line = line_idx == len(lines) - 1
+
+                    if is_last_match_in_line and not is_last_line:
+                        separators.append('\n')
+                    elif separator:
+                        separators.append(' ')
+                    else:
+                        separators.append('')
+        else:
+            # No sentence-ending punctuation found in this line, treat line as one sentence
+            if line:
+                sentences.append(line)
+                # Use newline separator if not the last line
+                is_last_line = line_idx == len(lines) - 1
+                if not is_last_line:
+                    separators.append('\n')
+                else:
+                    separators.append('')
 
     # Ensure last separator is empty (nothing after last sentence)
     if separators:
@@ -477,6 +494,13 @@ async def websocket_endpoint(ws: WebSocket):
                 # Save the source language
                 write_doc(source_lang, full_content)
 
+                # Broadcast the updated content to all clients viewing the source language
+                await broadcast_to_language(source_lang, {
+                    "type": "content",
+                    "language": source_lang,
+                    "content": full_content
+                }, exclude=ws)
+
                 # Delete the same sentence from all other languages
                 for target_lang in LANGUAGES:
                     if target_lang == source_lang:
@@ -517,6 +541,13 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Save the source language
                 write_doc(source_lang, full_content)
+
+                # Broadcast the updated content to all clients viewing the source language
+                await broadcast_to_language(source_lang, {
+                    "type": "content",
+                    "language": source_lang,
+                    "content": full_content
+                }, exclude=ws)
 
                 # Broadcast pending translation with original text to other languages
                 for target_lang in LANGUAGES:
@@ -590,6 +621,13 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Save the source language immediately
                 write_doc(source_lang, full_content)
+
+                # Broadcast the updated content to all clients viewing the source language
+                await broadcast_to_language(source_lang, {
+                    "type": "content",
+                    "language": source_lang,
+                    "content": full_content
+                }, exclude=ws)
 
                 # Broadcast pending translation with original text to other languages
                 for target_lang in LANGUAGES:

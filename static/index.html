@@ -146,36 +146,68 @@
         let lastError = null;
 
         // Split text into sentences (matches backend logic)
+        // A sentence is anything separated by '.' or newline
         // Supports ASCII and Chinese punctuation
         const splitSentences = (text) => {
             if (!text.trim()) return [];
-            return text.trim().split(/(?<=[.!?\u3002\uff01\uff1f])\s*/).filter(s => s.trim());
+            // Split on sentence-ending punctuation OR newlines
+            return text.trim().split(/(?<=[.!?\u3002\uff01\uff1f])\s*|\n+/).filter(s => s.trim());
         };
 
         // Split text into sentences while preserving separators
+        // A sentence is anything separated by '.' or newline
         // Supports ASCII and Chinese punctuation
         const splitSentencesWithSeparators = (text) => {
             if (!text.trim()) return { sentences: [], separators: [] };
 
-            // Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
-            const pattern = /(.*?[.!?\u3002\uff01\uff1f])(\s*)/gs;
             const sentences = [];
             const separators = [];
-            let match;
 
-            while ((match = pattern.exec(text.trim())) !== null) {
-                const sentence = match[1].trim();
-                const separator = match[2];
+            // Split by newlines first, then by sentence-ending punctuation within each line
+            // Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
+            const lines = text.trim().split('\n');
 
-                if (sentence) {
-                    sentences.push(sentence);
-                    // Normalize: preserve paragraph breaks (2+ newlines), otherwise single space
-                    if (separator.includes('\n\n') || (separator.match(/\n/g) || []).length >= 2) {
-                        separators.push('\n\n');
-                    } else if (separator) {
-                        separators.push(' ');
-                    } else {
-                        separators.push('');
+            for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+                const line = lines[lineIdx].trim();
+                if (!line) continue;
+
+                const pattern = /(.*?[.!?\u3002\uff01\uff1f])(\s*)/gs;
+                const matches = [];
+                let match;
+                while ((match = pattern.exec(line)) !== null) {
+                    matches.push([match[1], match[2]]);
+                }
+
+                if (matches.length > 0) {
+                    for (let matchIdx = 0; matchIdx < matches.length; matchIdx++) {
+                        const [sentence, separator] = matches[matchIdx];
+                        const trimmedSentence = sentence.trim();
+                        if (trimmedSentence) {
+                            sentences.push(trimmedSentence);
+                            // Determine separator: if last match in line and not last line, use newline
+                            const isLastMatchInLine = matchIdx === matches.length - 1;
+                            const isLastLine = lineIdx === lines.length - 1;
+
+                            if (isLastMatchInLine && !isLastLine) {
+                                separators.push('\n');
+                            } else if (separator) {
+                                separators.push(' ');
+                            } else {
+                                separators.push('');
+                            }
+                        }
+                    }
+                } else {
+                    // No sentence-ending punctuation found in this line, treat line as one sentence
+                    if (line) {
+                        sentences.push(line);
+                        // Use newline separator if not the last line
+                        const isLastLine = lineIdx === lines.length - 1;
+                        if (!isLastLine) {
+                            separators.push('\n');
+                        } else {
+                            separators.push('');
+                        }
                     }
                 }
             }
@@ -362,8 +394,8 @@
                         syncIndicator.classList.remove('error');
                         syncIndicator.textContent = 'Syncing...';
                     } else if (msg.status === 'completed') {
-                        syncIndicator.textContent = 'Synced!';
-                        setTimeout(() => syncIndicator.classList.remove('active'), 2000);
+                        // Hide immediately when complete (no "Synced!" message)
+                        syncIndicator.classList.remove('active');
                     } else if (msg.status === 'error') {
                         syncIndicator.classList.add('error');
                         syncIndicator.textContent = 'Sync failed';
