@@ -110,6 +110,8 @@
                 console.log('Received:', msg);
 
                 if (msg.type === 'doc') {
+                    // Clear any pending send to prevent loops
+                    clearTimeout(debounceTimer);
                     editor.value = msg.text;
                     lastSentText = msg.text;
                     pendingBlocks = {};

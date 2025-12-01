@@ -24,20 +24,17 @@ app = FastAPI()
 DOCS_DIR = Path("docs")
 DOCS_DIR.mkdir(exist_ok=True)
 
-# Sentence-ending characters (configurable)
 SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f'
 LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 
 clients: dict[WebSocket, str] = {}
 
-# --- Document Storage ---
-# Format: [{"en": "...", "pl": "...", "zh": "..."}, ".\n", {"en": "...", ...}, "!"]
-# Alternating: content dict, separator string, content dict, separator string, ...
+# Track recent translations to prevent loops: {(block_idx, target_lang): translated_text}
+recent_translations: dict[tuple[int, str], str] = {}
 
 DOC_PATH = DOCS_DIR / "document.json"
 
 def load_doc() -> list:
-    """Load document as list of content dicts and separator strings."""
     if DOC_PATH.exists():
         try:
             return json.loads(DOC_PATH.read_text())
@@ -46,46 +43,39 @@ def load_doc() -> list:
     return []
 
 def save_doc(doc: list):
-    """Save document."""
     logger.debug(f"save_doc: {len(doc)} items")
     DOC_PATH.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
 
 def doc_to_text(doc: list, lang: str) -> str:
-    """Convert document to plain text for a specific language."""
     parts = []
     for item in doc:
         if isinstance(item, dict):
             parts.append(item.get(lang, ""))
         else:
-            parts.append(item)  # separator string
+            parts.append(item)
     return "".join(parts)
 
 def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
-    """Parse text into document structure, preserving other languages from existing_doc."""
     if not text:
         return []
 
-    # Split text into content and separators
     pattern = f'([{re.escape(SENTENCE_ENDERS)}]+\\s*|\\n+)'
     parts = re.split(pattern, text)
 
     new_doc = []
     content_idx = 0
 
-    for i, part in enumerate(parts):
+    for part in parts:
         if not part:
             continue
 
-        # Check if separator
         is_sep = bool(re.match(f'^[{re.escape(SENTENCE_ENDERS)}\\s\\n]+$', part))
 
         if is_sep:
             new_doc.append(part)
         else:
-            # Content block - preserve other languages if they exist
             content_dict = {lang: part}
             if existing_doc:
-                # Find corresponding content block in existing doc
                 existing_contents = [item for item in existing_doc if isinstance(item, dict)]
                 if content_idx < len(existing_contents):
                     for other_lang in LANGUAGES:
@@ -97,18 +87,23 @@ def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
     return new_doc
 
 def get_content_blocks(doc: list) -> list[dict]:
-    """Get just the content blocks (dicts) from document."""
     return [item for item in doc if isinstance(item, dict)]
 
 # --- Translation ---
 
 def translate_block(block: str, prev_block: str, next_block: str,
                     prev_target: str, next_target: str,
+                    existing_translation: str,
                     source_lang: str, target_lang: str) -> str:
-    """Translate a content block with context."""
+    """Translate a content block with context and existing translation for consistency."""
     logger.info(f"Translating: {source_lang} -> {target_lang}")
 
     client = anthropic.Anthropic()
+
+    existing_hint = ""
+    if existing_translation and not existing_translation.startswith("["):
+        existing_hint = f"\nPrevious translation (for consistency, may need updating): {existing_translation}"
+
     prompt = f"""Translate from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}.
 
 Context (source language):
@@ -119,6 +114,7 @@ Next: {next_block or '(end)'}
 Target language context:
 Previous: {prev_target or '(start)'}
 Next: {next_target or '(end)'}
+{existing_hint}
 
 Return ONLY the translated sentence. No quotes, no explanation."""
 
@@ -148,7 +144,6 @@ async def broadcast_to_lang(lang: str, message: dict, exclude: WebSocket = None)
                 clients.pop(ws, None)
 
 async def send_doc_to_all(doc: list, exclude: WebSocket = None):
-    """Send document to all clients in their respective languages."""
     for ws, lang in list(clients.items()):
         if ws != exclude:
             try:
@@ -191,15 +186,22 @@ async def websocket_endpoint(ws: WebSocket):
                 old_contents = get_content_blocks(old_doc)
                 new_contents = get_content_blocks(new_doc)
 
-                # Find what changed
+                # Find what changed - only in SOURCE language
                 changed_indices = []
                 for i in range(max(len(old_contents), len(new_contents))):
-                    old_text = old_contents[i].get(source_lang, "") if i < len(old_contents) else None
-                    new_text_i = new_contents[i].get(source_lang, "") if i < len(new_contents) else None
+                    old_text = old_contents[i].get(source_lang, "") if i < len(old_contents) else ""
+                    new_text_i = new_contents[i].get(source_lang, "") if i < len(new_contents) else ""
+
+                    # Skip if this is a translation we just pushed (prevent loops)
+                    if (i, source_lang) in recent_translations:
+                        if recent_translations[(i, source_lang)] == new_text_i:
+                            logger.debug(f"Skipping block {i} - this is our own translation")
+                            continue
+
                     if old_text != new_text_i:
                         changed_indices.append(i)
 
-                # Save immediately (source language is already in new_doc)
+                # Save immediately
                 save_doc(new_doc)
 
                 # Broadcast to same-language clients
@@ -223,10 +225,8 @@ async def websocket_endpoint(ws: WebSocket):
                         original_text = new_contents[idx].get(source_lang, "")
                         for target_lang in LANGUAGES:
                             if target_lang != source_lang:
-                                # Put original text as placeholder
                                 new_contents[idx][target_lang] = f"[{original_text}]"
 
-                # Rebuild and broadcast with placeholders
                 save_doc(new_doc)
                 await send_doc_to_all(new_doc, exclude=ws)
 
@@ -239,7 +239,6 @@ async def websocket_endpoint(ws: WebSocket):
                     if not source_text:
                         continue
 
-                    # Get context
                     prev_source = new_contents[idx-1].get(source_lang, "") if idx > 0 else ""
                     next_source = new_contents[idx+1].get(source_lang, "") if idx < len(new_contents)-1 else ""
 
@@ -247,17 +246,31 @@ async def websocket_endpoint(ws: WebSocket):
                         if target_lang == source_lang:
                             continue
 
+                        # Get existing translation for consistency
+                        existing = ""
+                        if idx < len(old_contents) and target_lang in old_contents[idx]:
+                            existing = old_contents[idx][target_lang]
+
                         prev_target = new_contents[idx-1].get(target_lang, "") if idx > 0 else ""
                         next_target = new_contents[idx+1].get(target_lang, "") if idx < len(new_contents)-1 else ""
 
                         translated = translate_block(
                             source_text, prev_source, next_source,
                             prev_target, next_target,
+                            existing,
                             source_lang, target_lang
                         )
                         new_contents[idx][target_lang] = translated
 
-                # Save and broadcast final translations
+                        # Track this translation to prevent loops
+                        recent_translations[(idx, target_lang)] = translated
+
+                # Clean old entries from recent_translations (keep last 50)
+                if len(recent_translations) > 50:
+                    keys = list(recent_translations.keys())
+                    for k in keys[:-50]:
+                        del recent_translations[k]
+
                 save_doc(new_doc)
                 await send_doc_to_all(new_doc)
                 await broadcast({"type": "syncing", "active": False})
@@ -278,4 +291,4 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting server on 0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
