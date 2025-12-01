@@ -225,12 +225,15 @@ async def websocket_endpoint(ws: WebSocket):
                 # Save the source language
                 write_doc(source_lang, full_content)
 
-                # Notify translation in progress
-                await broadcast({
-                    "type": "translating",
-                    "sentence_index": sentence_idx,
-                    "source_language": source_lang
-                }, exclude=ws)
+                # Broadcast pending translation with original text to other languages
+                for target_lang in LANGUAGES:
+                    if target_lang != source_lang:
+                        await broadcast_to_language(target_lang, {
+                            "type": "pending_translation",
+                            "sentence_index": sentence_idx,
+                            "original_text": new_sentence,
+                            "source_language": source_lang
+                        })
 
                 # Get context for translation
                 sentences = split_sentences(full_content)
@@ -282,12 +285,15 @@ async def websocket_endpoint(ws: WebSocket):
                 # Save the source language immediately
                 write_doc(source_lang, full_content)
 
-                # Notify all clients that translation is in progress
-                await broadcast({
-                    "type": "translating",
-                    "sentence_index": sentence_idx,
-                    "source_language": source_lang
-                }, exclude=ws)
+                # Broadcast pending translation with original text to other languages
+                for target_lang in LANGUAGES:
+                    if target_lang != source_lang:
+                        await broadcast_to_language(target_lang, {
+                            "type": "pending_translation",
+                            "sentence_index": sentence_idx,
+                            "original_text": new_sentence,
+                            "source_language": source_lang
+                        })
 
                 # Get context for translation
                 sentences = split_sentences(full_content)

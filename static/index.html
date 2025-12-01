@@ -42,6 +42,9 @@
         .sentence-highlight {
             background: #ffeb3b; border-radius: 2px;
         }
+        .pending-translation {
+            background: #ffcccc; color: #cc0000; border-radius: 2px;
+        }
         #status {
             margin-top: 0.5rem; padding: 0.5rem;
             font-size: 0.875rem; color: #666;
@@ -126,6 +129,7 @@
         let previousContent = '';
         let currentLang = 'en';
         let translatingIndices = new Set();
+        let pendingTranslations = {};  // {index: {text, sourceLang}}
         let lastError = null;
 
         // Split text into sentences (matches backend logic)
@@ -134,16 +138,31 @@
             return text.trim().split(/(?<=[.!?])\s+/).filter(s => s);
         };
 
+        // Apply pending translation: insert original text at sentence index
+        const applyPendingTranslation = (index, originalText) => {
+            const sentences = splitSentences(editor.value);
+            // Insert or replace at the given index
+            while (sentences.length <= index) sentences.push('');
+            sentences[index] = originalText;
+            editor.value = sentences.join(' ');
+            previousContent = editor.value;
+            updateHighlightOverlay();
+        };
+
         // Render highlight overlay with highlighted sentences
         const updateHighlightOverlay = () => {
             const text = editor.value;
-            if (!text.trim() || translatingIndices.size === 0) {
+            const hasPending = Object.keys(pendingTranslations).length > 0;
+            if (!text.trim() || (translatingIndices.size === 0 && !hasPending)) {
                 editorHighlight.innerHTML = '';
                 return;
             }
             const sentences = splitSentences(text);
             const html = sentences.map((s, i) => {
                 const escaped = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                if (pendingTranslations[i]) {
+                    return `<span class="pending-translation">${escaped}</span>`;
+                }
                 return translatingIndices.has(i)
                     ? `<span class="sentence-highlight">${escaped}</span>`
                     : escaped;
@@ -220,10 +239,20 @@
                 const msg = JSON.parse(e.data);
 
                 if (msg.type === 'content' && msg.language === currentLang) {
-                    // Update editor (always update to handle undo, syncs, etc.)
+                    // Update editor - translation complete replaces pending
                     editor.value = msg.content;
                     previousContent = msg.content;
                     updateHighlightOverlay();
+                }
+
+                if (msg.type === 'pending_translation') {
+                    // Show original text immediately, highlighted red
+                    pendingTranslations[msg.sentence_index] = {
+                        text: msg.original_text,
+                        sourceLang: msg.source_language
+                    };
+                    applyPendingTranslation(msg.sentence_index, msg.original_text);
+                    updateTranslatingStatus();
                 }
 
                 if (msg.type === 'translating') {
@@ -233,6 +262,7 @@
 
                 if (msg.type === 'translation_complete') {
                     translatingIndices.delete(msg.sentence_index);
+                    delete pendingTranslations[msg.sentence_index];
                     updateTranslatingStatus();
                 }
 
