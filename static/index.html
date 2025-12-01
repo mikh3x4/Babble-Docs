@@ -90,8 +90,9 @@
             background: #17a2b8; color: white;
             font-size: 0.875rem; display: none;
             animation: pulse 1.5s ease-in-out infinite;
+            z-index: 9999;
         }
-        #sync-indicator.active { display: block; }
+        #sync-indicator.active { display: block !important; }
         #sync-indicator.error { background: #dc3545; animation: none; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
     </style>
@@ -145,16 +146,19 @@
         let lastError = null;
 
         // Split text into sentences (matches backend logic)
+        // Supports ASCII and Chinese punctuation
         const splitSentences = (text) => {
             if (!text.trim()) return [];
-            return text.trim().split(/(?<=[.!?])\s+/).filter(s => s);
+            return text.trim().split(/(?<=[.!?\u3002\uff01\uff1f])\s*/).filter(s => s.trim());
         };
 
         // Split text into sentences while preserving separators
+        // Supports ASCII and Chinese punctuation
         const splitSentencesWithSeparators = (text) => {
             if (!text.trim()) return { sentences: [], separators: [] };
 
-            const pattern = /(.*?[.!?])(\s*)/gs;
+            // Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
+            const pattern = /(.*?[.!?\u3002\uff01\uff1f])(\s*)/gs;
             const sentences = [];
             const separators = [];
             let match;

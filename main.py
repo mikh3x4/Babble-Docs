@@ -47,6 +47,7 @@ clients: dict[WebSocket, str] = {}
 
 # Idle consistency check state
 last_activity_time: float = 0
+last_edited_language: str = "en"  # Track which language was most recently edited
 IDLE_THRESHOLD_SECONDS = 30
 consistency_check_running = False
 
@@ -107,7 +108,7 @@ def undo_last() -> dict | None:
     return previous["documents"]
 
 def split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Handles ., !, ? followed by space or end.
+    """Split text into sentences. Handles ., !, ? and Chinese punctuation.
 
     Returns a list of sentences. Use split_sentences_with_separators() if you
     need to preserve original whitespace/formatting.
@@ -115,9 +116,10 @@ def split_sentences(text: str) -> list[str]:
     if not text.strip():
         logger.debug(f"split_sentences: empty text, returning []")
         return []
-    # Split on sentence-ending punctuation followed by space or end
-    parts = re.split(r'(?<=[.!?])\s+', text.strip())
-    result = [p for p in parts if p]
+    # Split on sentence-ending punctuation (ASCII and Chinese) followed by space or end
+    # Chinese punctuation: (full stop), (exclamation), (question mark)
+    parts = re.split(r'(?<=[.!?\u3002\uff01\uff1f])\s*', text.strip())
+    result = [p for p in parts if p.strip()]
     logger.debug(f"split_sentences: {len(result)} sentences from {len(text)} chars")
     return result
 
@@ -133,8 +135,9 @@ def split_sentences_with_separators(text: str) -> tuple[list[str], list[str]]:
         return [], []
 
     # Use findall to capture both sentences and separators
-    # Pattern: sentence ending with .!? followed by optional whitespace
-    pattern = r'(.*?[.!?])(\s*)'
+    # Pattern: sentence ending with .!? or Chinese punctuation, followed by optional whitespace
+    # Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
+    pattern = r'(.*?[.!?\u3002\uff01\uff1f])(\s*)'
     matches = re.findall(pattern, text.strip(), re.DOTALL)
 
     if not matches:
@@ -246,7 +249,12 @@ Return ONLY the translated sentence, nothing else. No quotes."""
 # --- Consistency Check ---
 
 async def run_consistency_check():
-    """Check all language versions for consistency and reconcile if needed."""
+    """Check all language versions for consistency and reconcile if needed.
+
+    Uses the most recently edited language as the source of truth, translating
+    its content to all other languages. This respects intentional deletions
+    rather than merging all content together.
+    """
     global consistency_check_running
     if consistency_check_running:
         logger.debug("Consistency check already running, skipping")
@@ -270,33 +278,48 @@ async def run_consistency_check():
             return  # All same count, assume in sync
 
         logger.info(f"Sentence count mismatch detected: {sentence_counts}")
+        logger.info(f"Using {last_edited_language} as source of truth (most recently edited)")
 
         # Notify clients that sync is starting
         logger.info("Broadcasting consistency_check status: started")
         await broadcast({"type": "consistency_check", "status": "started"})
 
-        # Use Claude to reconcile
+        # Use the most recently edited language as source of truth
+        source_lang = last_edited_language
+        source_content = docs[source_lang]
+        source_sentences = split_sentences(source_content)
+
+        if not source_sentences:
+            logger.debug(f"Source language {source_lang} is empty, clearing all documents")
+            # Save snapshot before clearing
+            save_snapshot("consistency_check")
+            for lang in LANGUAGES:
+                write_doc(lang, "")
+                await broadcast_to_language(lang, {
+                    "type": "content",
+                    "language": lang,
+                    "content": ""
+                })
+            logger.info("Broadcasting consistency_check status: completed")
+            await broadcast({"type": "consistency_check", "status": "completed"})
+            logger.info("Consistency check completed - all documents cleared")
+            return
+
+        # Use Claude to translate the source to other languages
         client = anthropic.Anthropic()
 
-        doc_descriptions = "\n\n".join(
-            f"=== {LANGUAGES[lang]} ({lang}) ===\n{content or '(empty)'}"
-            for lang, content in docs.items()
-        )
+        prompt = f"""The {LANGUAGES[source_lang]} version of a document is the authoritative version.
+Translate it to the other languages while preserving the exact same number of sentences.
 
-        prompt = f"""Here are 3 versions of a document in different languages. They should have the same content (same number of corresponding sentences) but are out of sync.
+=== {LANGUAGES[source_lang]} (SOURCE - this is authoritative) ===
+{source_content}
 
-{doc_descriptions}
-
-Analyze these versions and produce reconciled versions that:
-1. Have the same number of sentences across all languages
-2. Preserve the most recent/complete information from all versions
-3. Maintain proper translations between languages
+Translate the above to {', '.join(LANGUAGES[lang] for lang in LANGUAGES if lang != source_lang)}.
+Each translation must have exactly {len(source_sentences)} sentences, matching the source.
 
 Return your response in this exact JSON format (no other text):
 {{
-  "en": "Full English text here...",
-  "pl": "Full Polish text here...",
-  "zh": "Full Chinese text here..."
+{', '.join(f'  "{lang}": "Full {LANGUAGES[lang]} text here..."' for lang in LANGUAGES if lang != source_lang)}
 }}"""
 
         response = client.messages.create(
@@ -313,15 +336,22 @@ Return your response in this exact JSON format (no other text):
             if response_text.startswith("json"):
                 response_text = response_text[4:]
 
-        reconciled = json.loads(response_text)
+        translations = json.loads(response_text)
 
         # Save snapshot before reconciliation
         save_snapshot("consistency_check")
 
-        # Save reconciled docs and broadcast to clients
+        # Keep the source language as-is, update others with translations
         for lang in LANGUAGES:
-            if lang in reconciled:
-                content = reconciled[lang]
+            if lang == source_lang:
+                # Broadcast the source content to ensure clients are in sync
+                await broadcast_to_language(lang, {
+                    "type": "content",
+                    "language": lang,
+                    "content": source_content
+                })
+            elif lang in translations:
+                content = translations[lang]
                 write_doc(lang, content)
                 await broadcast_to_language(lang, {
                     "type": "content",
@@ -358,12 +388,14 @@ async def idle_check_loop():
             last_activity_time = 0  # Reset to prevent repeated checks
             await run_consistency_check()
 
-def update_activity():
-    """Update the last activity timestamp."""
-    global last_activity_time
+def update_activity(edited_lang: str = None):
+    """Update the last activity timestamp and optionally track which language was edited."""
+    global last_activity_time, last_edited_language
     import time
     last_activity_time = time.time()
-    logger.debug(f"update_activity: timestamp set to {last_activity_time}")
+    if edited_lang:
+        last_edited_language = edited_lang
+    logger.debug(f"update_activity: timestamp set to {last_activity_time}, last_edited_language={last_edited_language}")
 
 # --- WebSocket Broadcasting ---
 
@@ -432,8 +464,8 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg_type == "delete":
                 # Client deleted a sentence
-                update_activity()
                 source_lang = data["language"]
+                update_activity(source_lang)
                 sentence_idx = data["sentence_index"]
                 full_content = data["full_content"]
                 logger.info(f"Delete operation: sentence {sentence_idx} in {source_lang}")
@@ -472,8 +504,8 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg_type == "insert":
                 # Client inserted a new sentence
-                update_activity()
                 source_lang = data["language"]
+                update_activity(source_lang)
                 sentence_idx = data["sentence_index"]
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
@@ -545,8 +577,8 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg_type == "edit":
                 # Client made an edit
-                update_activity()
                 source_lang = data["language"]
+                update_activity(source_lang)
                 sentence_idx = data["sentence_index"]
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
