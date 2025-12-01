@@ -68,6 +68,12 @@
             border-radius: 4px; cursor: pointer; font-size: 0.875rem;
         }
         #retry-btn:hover { background: #c82333; }
+        #undo-btn {
+            padding: 0.5rem 1rem; font-size: 1rem;
+            background: #6c757d; color: white; border: none;
+            border-radius: 4px; cursor: pointer; margin-left: 1rem;
+        }
+        #undo-btn:hover { background: #5a6268; }
         .spinner {
             display: inline-block; width: 12px; height: 12px;
             border: 2px solid #ff6b00; border-top-color: transparent;
@@ -80,11 +86,14 @@
 <body>
     <header>
         <h1>Babbel Docs</h1>
-        <select id="language">
-            <option value="en">English</option>
-            <option value="pl">Polski</option>
-            <option value="zh">中文</option>
-        </select>
+        <div>
+            <select id="language">
+                <option value="en">English</option>
+                <option value="pl">Polski</option>
+                <option value="zh">中文</option>
+            </select>
+            <button id="undo-btn">Undo</button>
+        </div>
     </header>
 
     <div class="editor-container">
@@ -110,6 +119,7 @@
         const statusText = document.getElementById('status-text');
         const connectionStats = document.getElementById('connection-stats');
         const retryBtn = document.getElementById('retry-btn');
+        const undoBtn = document.getElementById('undo-btn');
         const spinner = document.querySelector('.spinner');
 
         let ws = null;
@@ -194,12 +204,10 @@
                 const msg = JSON.parse(e.data);
 
                 if (msg.type === 'content' && msg.language === currentLang) {
-                    // Only update if we're not currently editing
-                    if (document.activeElement !== editor) {
-                        editor.value = msg.content;
-                        previousContent = msg.content;
-                        updateHighlightOverlay();
-                    }
+                    // Update editor (always update to handle undo, syncs, etc.)
+                    editor.value = msg.content;
+                    previousContent = msg.content;
+                    updateHighlightOverlay();
                 }
 
                 if (msg.type === 'translating') {
@@ -300,6 +308,13 @@
             currentLang = langSelect.value;
             if (ws?.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'load', language: currentLang }));
+            }
+        });
+
+        // Undo button
+        undoBtn.addEventListener('click', () => {
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'undo' }));
             }
         });
 

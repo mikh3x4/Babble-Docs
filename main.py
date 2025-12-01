@@ -18,6 +18,7 @@ load_dotenv()
 app = FastAPI()
 DOCS_DIR = Path("docs")
 DOCS_DIR.mkdir(exist_ok=True)
+HISTORY_FILE = Path("edit_history.json")
 LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 
 # Connected WebSocket clients: {websocket: language}
@@ -34,6 +35,45 @@ def read_doc(lang: str) -> str:
 
 def write_doc(lang: str, content: str):
     get_doc_path(lang).write_text(content)
+
+# --- Edit History ---
+
+def load_history() -> list:
+    if HISTORY_FILE.exists():
+        return json.loads(HISTORY_FILE.read_text())
+    return []
+
+def save_history(history: list):
+    HISTORY_FILE.write_text(json.dumps(history, indent=2))
+
+def save_snapshot(operation: str):
+    """Save current state of all documents before an operation."""
+    from datetime import datetime
+    snapshot = {
+        "timestamp": datetime.now().isoformat(),
+        "operation": operation,
+        "documents": {lang: read_doc(lang) for lang in LANGUAGES}
+    }
+    history = load_history()
+    history.append(snapshot)
+    # Keep last 50 entries to avoid unbounded growth
+    save_history(history[-50:])
+
+def undo_last() -> dict | None:
+    """Revert to the previous state. Returns the restored documents or None."""
+    history = load_history()
+    if len(history) < 1:
+        return None
+    # Pop the last entry (current state before most recent edit) and restore it
+    history.pop()  # Remove the most recent snapshot
+    if not history:
+        save_history([])
+        return None
+    previous = history[-1]
+    for lang, content in previous["documents"].items():
+        write_doc(lang, content)
+    save_history(history)
+    return previous["documents"]
 
 def split_sentences(text: str) -> list[str]:
     """Split text into sentences. Handles ., !, ? followed by space or end."""
@@ -149,6 +189,9 @@ async def websocket_endpoint(ws: WebSocket):
                 sentence_idx = data["sentence_index"]
                 full_content = data["full_content"]
 
+                # Save snapshot before making changes
+                save_snapshot("delete")
+
                 # Save the source language
                 write_doc(source_lang, full_content)
 
@@ -175,6 +218,9 @@ async def websocket_endpoint(ws: WebSocket):
                 sentence_idx = data["sentence_index"]
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
+
+                # Save snapshot before making changes
+                save_snapshot("insert")
 
                 # Save the source language
                 write_doc(source_lang, full_content)
@@ -230,6 +276,9 @@ async def websocket_endpoint(ws: WebSocket):
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
 
+                # Save snapshot before making changes
+                save_snapshot("edit")
+
                 # Save the source language immediately
                 write_doc(source_lang, full_content)
 
@@ -281,6 +330,25 @@ async def websocket_endpoint(ws: WebSocket):
                         "type": "translation_error",
                         "sentence_index": sentence_idx,
                         "error": str(e)
+                    })
+
+            elif msg_type == "undo":
+                # Revert to previous state
+                restored = undo_last()
+                if restored:
+                    # Broadcast updated content to all clients
+                    for lang, content in restored.items():
+                        await broadcast_to_language(lang, {
+                            "type": "content",
+                            "language": lang,
+                            "content": content
+                        })
+                    # Also send to the requesting client
+                    client_lang = clients.get(ws, "en")
+                    await ws.send_json({
+                        "type": "content",
+                        "language": client_lang,
+                        "content": restored.get(client_lang, "")
                     })
 
     except WebSocketDisconnect:
