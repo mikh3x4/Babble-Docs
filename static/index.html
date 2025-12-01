@@ -205,14 +205,23 @@
             };
         };
 
+        // Check if change is structure-only (just separators/whitespace)
+        const isStructureOnlyChange = (oldText, newText) => {
+            const getContent = (t) => t.replace(new RegExp(`[${SENTENCE_ENDERS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s\\n]+`, 'g'), '');
+            return getContent(oldText) === getContent(newText);
+        };
+
         // Send update when user stops typing
         editor.addEventListener('input', () => {
             if (receivingUpdate) return;
 
             clearTimeout(debounceTimer);
+            const text = editor.value.replace(new RegExp(PLACEHOLDER, 'g'), '');
+
+            // Use shorter debounce for structure-only changes (100ms vs 500ms)
+            const delay = isStructureOnlyChange(lastSentText, text) ? 100 : 500;
+
             debounceTimer = setTimeout(() => {
-                // Replace placeholders with empty string before sending
-                const text = editor.value.replace(new RegExp(PLACEHOLDER, 'g'), '');
                 if (text !== lastSentText && ws?.readyState === WebSocket.OPEN) {
                     console.log('Sending update');
                     ws.send(JSON.stringify({
@@ -222,7 +231,7 @@
                     }));
                     lastSentText = text;
                 }
-            }, 500);
+            }, delay);
         });
 
         // Sync scroll

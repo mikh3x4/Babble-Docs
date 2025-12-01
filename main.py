@@ -65,7 +65,7 @@ def doc_to_text(doc: list, lang: str) -> str:
     return "".join(parts)
 
 def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
-    """Parse text into doc structure, preserving translations by index."""
+    """Parse text into doc structure, preserving translations by CONTENT matching."""
     if not text:
         return []
 
@@ -78,23 +78,31 @@ def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
     def is_sep(p):
         return bool(re.match(f'^[{re.escape(SENTENCE_ENDERS)}\\s\\n]+$', p))
 
+    # Build lookup: content -> old block (for content matching)
     old_contents = [item for item in existing_doc if isinstance(item, dict)] if existing_doc else []
+    content_to_block = {}
+    for block in old_contents:
+        content = block.get(lang, "")
+        if content and content not in content_to_block:
+            content_to_block[content] = block
 
     new_doc = []
-    content_idx = 0
+    used_contents = set()  # Track which old blocks we've used
 
     for part in parts:
         if is_sep(part):
             new_doc.append(part)
         else:
             content_dict = {lang: part}
-            # Copy translations from same index
-            if content_idx < len(old_contents):
+            # Try to find exact content match in old blocks
+            if part in content_to_block and part not in used_contents:
+                old_block = content_to_block[part]
+                used_contents.add(part)
+                # Copy translations from matched block
                 for other_lang in LANGUAGES:
-                    if other_lang != lang and other_lang in old_contents[content_idx]:
-                        content_dict[other_lang] = old_contents[content_idx][other_lang]
+                    if other_lang != lang and other_lang in old_block:
+                        content_dict[other_lang] = old_block[other_lang]
             new_doc.append(content_dict)
-            content_idx += 1
 
     return new_doc
 
@@ -205,16 +213,8 @@ async def do_translation(source_lang: str, changed_indices: list, exclude_ws: We
             logger.info("Translation cancelled during delay")
             return
 
-        # Notify ONLY other-language clients that translation is starting
-        # Same-language clients already have the text, they don't need the highlight
-        logger.info(f"Starting translation, notifying non-{source_lang} clients")
-        for ws, ws_lang in list(clients.items()):
-            if ws_lang != source_lang:  # Only other languages
-                try:
-                    await ws.send_json({"type": "translating", "blocks": changed_indices})
-                    logger.info(f"Sent translating to {ws_lang} client")
-                except:
-                    clients.pop(ws, None)
+        # Highlight already sent immediately in websocket handler
+        logger.info(f"Starting translation for blocks {changed_indices}")
 
         # Load current doc state
         doc = load_doc()
@@ -306,12 +306,7 @@ async def do_translation(source_lang: str, changed_indices: list, exclude_ws: We
 
     except asyncio.CancelledError:
         logger.info("Translation task cancelled")
-        # Clear for all non-source-lang clients (source_lang might not be in scope if cancelled early)
-        for ws in list(clients.keys()):
-            try:
-                await ws.send_json({"type": "translating", "blocks": []})
-            except:
-                clients.pop(ws, None)
+        # Don't clear highlights - new task will send its own, or edit handler already did
     except Exception as e:
         logger.error(f"Translation error: {e}")
         for ws in list(clients.keys()):
@@ -364,33 +359,33 @@ async def websocket_endpoint(ws: WebSocket):
                 new_contents = get_content_blocks(new_doc)
                 logger.info(f"Blocks: {len(old_contents)} -> {len(new_contents)}")
 
-                # Find changed blocks by comparing content
+                # Find blocks that need translation (missing any target language)
+                # Content matching in text_to_doc already preserved translations for unchanged blocks
                 changed_indices = []
-                for i in range(max(len(old_contents), len(new_contents))):
-                    old_text = old_contents[i].get(source_lang, "") if i < len(old_contents) else ""
-                    new_text_i = new_contents[i].get(source_lang, "") if i < len(new_contents) else ""
-                    if old_text != new_text_i:
-                        changed_indices.append(i)
-                        logger.info(f"Block {i} changed: '{old_text[:20]}' -> '{new_text_i[:20]}'")
-
-                # Also find blocks missing translations (from interrupted translations)
                 for i, block in enumerate(new_contents):
-                    if i not in changed_indices:
-                        # Check if any target language is missing
-                        for lang in LANGUAGES:
-                            if lang != source_lang and lang not in block:
-                                changed_indices.append(i)
-                                logger.info(f"Block {i} missing {lang} translation")
-                                break
-                changed_indices = sorted(set(changed_indices))
+                    block_text = block.get(source_lang, "")[:30]
+                    for lang in LANGUAGES:
+                        if lang != source_lang and lang not in block:
+                            changed_indices.append(i)
+                            logger.info(f"Block {i} needs translation (missing {lang}): '{block_text}'")
+                            break
 
-                # Save and broadcast
-                save_doc(new_doc)
+                # Broadcast immediately, save async
                 await send_doc_to_all(new_doc, exclude=ws)
+                save_doc(new_doc)  # TODO: make truly async if needed
 
                 if not changed_indices:
                     logger.info("No content changes")
                     continue
+
+                # Send translating highlight IMMEDIATELY (don't wait for 2s delay)
+                for ws_client, ws_lang in list(clients.items()):
+                    if ws_lang != source_lang:
+                        try:
+                            await ws_client.send_json({"type": "translating", "blocks": changed_indices})
+                        except:
+                            clients.pop(ws_client, None)
+                logger.info(f"Sent immediate translating highlight for blocks: {changed_indices}")
 
                 # Cancel any pending translation and start new one
                 cancel_pending_translation()
