@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Babbel Docs</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 800px; margin: 0 auto; padding: 2rem;
+            background: #f5f5f5;
+        }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+        h1 { font-size: 1.5rem; color: #333; }
+        select {
+            padding: 0.5rem 1rem; font-size: 1rem;
+            border: 1px solid #ccc; border-radius: 4px;
+        }
+        #editor {
+            width: 100%; min-height: 400px; padding: 1rem;
+            font-size: 1rem; line-height: 1.6;
+            border: 2px solid #ddd; border-radius: 8px;
+            background: white; resize: vertical;
+        }
+        #editor:focus { outline: none; border-color: #007bff; }
+        #status {
+            margin-top: 0.5rem; padding: 0.5rem;
+            font-size: 0.875rem; color: #666;
+        }
+        .translating { color: #ff6b00; font-weight: bold; }
+        .connected { color: #28a745; }
+        .disconnected { color: #dc3545; }
+
+        /* Sentence highlighting overlay */
+        #sentence-status {
+            margin-top: 0.5rem; padding: 0.75rem;
+            background: #fff3cd; border-radius: 4px;
+            display: none;
+        }
+        #sentence-status.active { display: block; }
+        .spinner {
+            display: inline-block; width: 12px; height: 12px;
+            border: 2px solid #ff6b00; border-top-color: transparent;
+            border-radius: 50%; animation: spin 1s linear infinite;
+            margin-right: 0.5rem;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Babbel Docs</h1>
+        <select id="language">
+            <option value="en">English</option>
+            <option value="pl">Polski</option>
+            <option value="zh">中文</option>
+        </select>
+    </header>
+
+    <textarea id="editor" placeholder="Start typing..."></textarea>
+
+    <div id="sentence-status">
+        <span class="spinner"></span>
+        <span id="status-text">Translating sentence...</span>
+    </div>
+
+    <div id="status" class="disconnected">Disconnected</div>
+
+    <script>
+        const editor = document.getElementById('editor');
+        const langSelect = document.getElementById('language');
+        const statusEl = document.getElementById('status');
+        const sentenceStatus = document.getElementById('sentence-status');
+        const statusText = document.getElementById('status-text');
+
+        let ws = null;
+        let previousContent = '';
+        let currentLang = 'en';
+        let translatingIndices = new Set();
+
+        // Split text into sentences (matches backend logic)
+        const splitSentences = (text) => {
+            if (!text.trim()) return [];
+            return text.trim().split(/(?<=[.!?])\s+/).filter(s => s);
+        };
+
+        // Find which sentence changed between old and new text
+        const findChangedSentence = (oldText, newText) => {
+            const oldSentences = splitSentences(oldText);
+            const newSentences = splitSentences(newText);
+
+            // Find first differing sentence
+            const maxLen = Math.max(oldSentences.length, newSentences.length);
+            for (let i = 0; i < maxLen; i++) {
+                if (oldSentences[i] !== newSentences[i]) {
+                    return { index: i, sentence: newSentences[i] || '' };
+                }
+            }
+            return null;
+        };
+
+        const connect = () => {
+            ws = new WebSocket(`ws://${location.host}/ws`);
+
+            ws.onopen = () => {
+                statusEl.textContent = 'Connected';
+                statusEl.className = 'connected';
+                ws.send(JSON.stringify({ type: 'load', language: currentLang }));
+            };
+
+            ws.onclose = () => {
+                statusEl.textContent = 'Disconnected - reconnecting...';
+                statusEl.className = 'disconnected';
+                setTimeout(connect, 2000);
+            };
+
+            ws.onmessage = (e) => {
+                const msg = JSON.parse(e.data);
+
+                if (msg.type === 'content' && msg.language === currentLang) {
+                    // Only update if we're not currently editing
+                    if (document.activeElement !== editor) {
+                        editor.value = msg.content;
+                        previousContent = msg.content;
+                    }
+                }
+
+                if (msg.type === 'translating') {
+                    translatingIndices.add(msg.sentence_index);
+                    updateTranslatingStatus();
+                }
+
+                if (msg.type === 'translation_complete') {
+                    translatingIndices.delete(msg.sentence_index);
+                    updateTranslatingStatus();
+                }
+            };
+        };
+
+        const updateTranslatingStatus = () => {
+            if (translatingIndices.size > 0) {
+                sentenceStatus.classList.add('active');
+                const indices = [...translatingIndices].join(', ');
+                statusText.textContent = `Translating sentence ${indices}...`;
+            } else {
+                sentenceStatus.classList.remove('active');
+            }
+        };
+
+        // Send edit when user stops typing (debounced)
+        let editTimeout = null;
+        editor.addEventListener('input', () => {
+            clearTimeout(editTimeout);
+            editTimeout = setTimeout(() => {
+                const change = findChangedSentence(previousContent, editor.value);
+                if (change && ws?.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'edit',
+                        language: currentLang,
+                        sentence_index: change.index,
+                        new_sentence: change.sentence,
+                        full_content: editor.value
+                    }));
+                    previousContent = editor.value;
+                }
+            }, 500);
+        });
+
+        // Language switching
+        langSelect.addEventListener('change', () => {
+            currentLang = langSelect.value;
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'load', language: currentLang }));
+            }
+        });
+
+        connect();
+    </script>
+</body>
+</html>
