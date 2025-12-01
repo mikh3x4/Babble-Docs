@@ -84,6 +84,16 @@
             margin-right: 0.5rem;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+        #sync-indicator {
+            position: fixed; top: 1rem; right: 1rem;
+            padding: 0.5rem 1rem; border-radius: 4px;
+            background: #17a2b8; color: white;
+            font-size: 0.875rem; display: none;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        #sync-indicator.active { display: block; }
+        #sync-indicator.error { background: #dc3545; animation: none; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
     </style>
 </head>
 <body>
@@ -112,6 +122,7 @@
 
     <div id="connection-stats"></div>
     <div id="status" class="disconnected">Disconnected</div>
+    <div id="sync-indicator">Syncing...</div>
 
     <script>
         const editor = document.getElementById('editor');
@@ -124,6 +135,7 @@
         const retryBtn = document.getElementById('retry-btn');
         const undoBtn = document.getElementById('undo-btn');
         const spinner = document.querySelector('.spinner');
+        const syncIndicator = document.getElementById('sync-indicator');
 
         let ws = null;
         let previousContent = '';
@@ -277,6 +289,23 @@
                         .map(([lang, count]) => `${count} ${lang}`)
                         .join(', ');
                     connectionStats.textContent = `${msg.total} user${msg.total !== 1 ? 's' : ''} online (${breakdown})`;
+                }
+
+                if (msg.type === 'consistency_check') {
+                    if (msg.status === 'started') {
+                        syncIndicator.classList.add('active');
+                        syncIndicator.classList.remove('error');
+                        syncIndicator.textContent = 'Syncing...';
+                    } else if (msg.status === 'completed') {
+                        syncIndicator.textContent = 'Synced!';
+                        setTimeout(() => syncIndicator.classList.remove('active'), 2000);
+                    } else if (msg.status === 'error') {
+                        syncIndicator.classList.add('error');
+                        syncIndicator.textContent = 'Sync failed';
+                        setTimeout(() => {
+                            syncIndicator.classList.remove('active', 'error');
+                        }, 3000);
+                    }
                 }
             };
         };

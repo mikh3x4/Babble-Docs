@@ -16,6 +16,11 @@ import anthropic
 load_dotenv()
 
 app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(idle_check_loop())
+
 DOCS_DIR = Path("docs")
 DOCS_DIR.mkdir(exist_ok=True)
 HISTORY_FILE = Path("edit_history.json")
@@ -23,6 +28,11 @@ LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 
 # Connected WebSocket clients: {websocket: language}
 clients: dict[WebSocket, str] = {}
+
+# Idle consistency check state
+last_activity_time: float = 0
+IDLE_THRESHOLD_SECONDS = 30
+consistency_check_running = False
 
 # --- Document Storage ---
 
@@ -129,6 +139,114 @@ Return ONLY the translated sentence, nothing else. No quotes."""
     except anthropic.APIError as e:
         raise TranslationError(f"API error: {e.message}")
 
+# --- Consistency Check ---
+
+async def run_consistency_check():
+    """Check all language versions for consistency and reconcile if needed."""
+    global consistency_check_running
+    if consistency_check_running:
+        return
+
+    consistency_check_running = True
+    try:
+        # Read all documents
+        docs = {lang: read_doc(lang) for lang in LANGUAGES}
+        sentence_counts = {lang: len(split_sentences(content)) for lang, content in docs.items()}
+
+        # Check if counts differ (indicates sync issue)
+        counts = list(sentence_counts.values())
+        if not counts or all(c == 0 for c in counts):
+            return  # Empty docs, nothing to reconcile
+
+        if len(set(counts)) == 1:
+            return  # All same count, assume in sync
+
+        # Notify clients that sync is starting
+        await broadcast({"type": "consistency_check", "status": "started"})
+
+        # Use Claude to reconcile
+        client = anthropic.Anthropic()
+
+        doc_descriptions = "\n\n".join(
+            f"=== {LANGUAGES[lang]} ({lang}) ===\n{content or '(empty)'}"
+            for lang, content in docs.items()
+        )
+
+        prompt = f"""Here are 3 versions of a document in different languages. They should have the same content (same number of corresponding sentences) but are out of sync.
+
+{doc_descriptions}
+
+Analyze these versions and produce reconciled versions that:
+1. Have the same number of sentences across all languages
+2. Preserve the most recent/complete information from all versions
+3. Maintain proper translations between languages
+
+Return your response in this exact JSON format (no other text):
+{{
+  "en": "Full English text here...",
+  "pl": "Full Polish text here...",
+  "zh": "Full Chinese text here..."
+}}"""
+
+        response = client.messages.create(
+            model="claude-opus-4-20250514",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        # Parse response
+        response_text = response.content[0].text.strip()
+        # Extract JSON from response (handle potential markdown code blocks)
+        if "```" in response_text:
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+
+        reconciled = json.loads(response_text)
+
+        # Save snapshot before reconciliation
+        save_snapshot("consistency_check")
+
+        # Save reconciled docs and broadcast to clients
+        for lang in LANGUAGES:
+            if lang in reconciled:
+                content = reconciled[lang]
+                write_doc(lang, content)
+                await broadcast_to_language(lang, {
+                    "type": "content",
+                    "language": lang,
+                    "content": content
+                })
+
+        await broadcast({"type": "consistency_check", "status": "completed"})
+
+    except Exception as e:
+        await broadcast({"type": "consistency_check", "status": "error", "error": str(e)})
+    finally:
+        consistency_check_running = False
+
+async def idle_check_loop():
+    """Background task that triggers consistency check after idle period."""
+    global last_activity_time
+    import time
+
+    while True:
+        await asyncio.sleep(5)  # Check every 5 seconds
+
+        if last_activity_time == 0:
+            continue
+
+        elapsed = time.time() - last_activity_time
+        if elapsed >= IDLE_THRESHOLD_SECONDS and not consistency_check_running:
+            last_activity_time = 0  # Reset to prevent repeated checks
+            await run_consistency_check()
+
+def update_activity():
+    """Update the last activity timestamp."""
+    global last_activity_time
+    import time
+    last_activity_time = time.time()
+
 # --- WebSocket Broadcasting ---
 
 async def broadcast(message: dict, exclude: WebSocket = None):
@@ -185,6 +303,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg_type == "delete":
                 # Client deleted a sentence
+                update_activity()
                 source_lang = data["language"]
                 sentence_idx = data["sentence_index"]
                 full_content = data["full_content"]
@@ -214,6 +333,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg_type == "insert":
                 # Client inserted a new sentence
+                update_activity()
                 source_lang = data["language"]
                 sentence_idx = data["sentence_index"]
                 new_sentence = data["new_sentence"]
@@ -274,6 +394,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg_type == "edit":
                 # Client made an edit
+                update_activity()
                 source_lang = data["language"]
                 sentence_idx = data["sentence_index"]
                 new_sentence = data["new_sentence"]
