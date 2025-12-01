@@ -124,17 +124,15 @@
             return blocks;
         };
 
+        // Placeholder for untranslated blocks (must match backend)
+        const PLACEHOLDER = '…';
+
         // Update highlight layer to show translating blocks
         const updateHighlights = () => {
-            if (translatingBlocks.length === 0) {
-                highlightLayer.innerHTML = '';
-                return;
-            }
-
             const blocks = splitIntoBlocks(editor.value);
-            console.log('Highlighting blocks:', translatingBlocks, 'Text blocks:', blocks.map((b, i) => ({i, type: b.type, text: b.text.slice(0, 20)})));
             let contentIdx = 0;
             let html = '';
+            let hasHighlights = false;
 
             for (const block of blocks) {
                 const escaped = block.text
@@ -144,9 +142,11 @@
                     .replace(/\n/g, '<br>');
 
                 if (block.type === 'content') {
-                    const shouldHighlight = translatingBlocks.includes(contentIdx);
+                    const isPlaceholder = block.text === PLACEHOLDER;
+                    const shouldHighlight = translatingBlocks.includes(contentIdx) || isPlaceholder;
+
                     if (shouldHighlight) {
-                        console.log(`Highlighting content block ${contentIdx}: "${block.text.slice(0, 30)}"`);
+                        hasHighlights = true;
                         html += `<span class="highlight-block">${escaped}</span>`;
                     } else {
                         html += escaped;
@@ -157,7 +157,7 @@
                 }
             }
 
-            highlightLayer.innerHTML = html;
+            highlightLayer.innerHTML = hasHighlights ? html : '';
         };
 
         const connect = () => {
@@ -211,7 +211,8 @@
 
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => {
-                const text = editor.value;
+                // Replace placeholders with empty string before sending
+                const text = editor.value.replace(new RegExp(PLACEHOLDER, 'g'), '');
                 if (text !== lastSentText && ws?.readyState === WebSocket.OPEN) {
                     console.log('Sending update');
                     ws.send(JSON.stringify({

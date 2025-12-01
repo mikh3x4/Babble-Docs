@@ -32,6 +32,7 @@ DOCS_DIR.mkdir(exist_ok=True)
 SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f'
 LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 TRANSLATION_DELAY = 2.0  # seconds to wait before starting translation
+PLACEHOLDER = '…'  # Used for untranslated blocks
 
 clients: dict[WebSocket, str] = {}
 DOC_PATH = DOCS_DIR / "document.json"
@@ -52,10 +53,13 @@ def save_doc(doc: list):
     DOC_PATH.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
 
 def doc_to_text(doc: list, lang: str) -> str:
+    """Convert doc to text for a specific language. Use placeholder for missing translations."""
     parts = []
     for item in doc:
         if isinstance(item, dict):
-            parts.append(item.get(lang, ""))
+            text = item.get(lang, "")
+            # Use placeholder for missing translations to preserve block structure
+            parts.append(text if text else PLACEHOLDER)
         else:
             parts.append(item)
     return "".join(parts)
@@ -64,6 +68,9 @@ def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
     """Parse text into doc structure, preserving translations by index."""
     if not text:
         return []
+
+    # Remove placeholders from incoming text
+    text = text.replace(PLACEHOLDER, '')
 
     pattern = f'([{re.escape(SENTENCE_ENDERS)}]+\\s*|\\n+)'
     parts = [p for p in re.split(pattern, text) if p]
@@ -365,6 +372,17 @@ async def websocket_endpoint(ws: WebSocket):
                     if old_text != new_text_i:
                         changed_indices.append(i)
                         logger.info(f"Block {i} changed: '{old_text[:20]}' -> '{new_text_i[:20]}'")
+
+                # Also find blocks missing translations (from interrupted translations)
+                for i, block in enumerate(new_contents):
+                    if i not in changed_indices:
+                        # Check if any target language is missing
+                        for lang in LANGUAGES:
+                            if lang != source_lang and lang not in block:
+                                changed_indices.append(i)
+                                logger.info(f"Block {i} missing {lang} translation")
+                                break
+                changed_indices = sorted(set(changed_indices))
 
                 # Save and broadcast
                 save_doc(new_doc)
