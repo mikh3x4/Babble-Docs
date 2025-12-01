@@ -6,6 +6,7 @@ import os
 import re
 import json
 import asyncio
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -13,13 +14,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import anthropic
 
+# Configure logging to write to both console and file
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('babbel.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
+    logger.info("Babbel Docs server starting up")
+    logger.info(f"Documents directory: {DOCS_DIR.absolute()}")
+    logger.info(f"Supported languages: {list(LANGUAGES.keys())}")
     asyncio.create_task(idle_check_loop())
+    logger.debug("Idle check background task started")
 
 DOCS_DIR = Path("docs")
 DOCS_DIR.mkdir(exist_ok=True)
@@ -112,6 +128,7 @@ class TranslationError(Exception):
 def translate_sentence(sentence: str, context_before: list[str], context_after: list[str],
                        source_lang: str, target_lang: str) -> str:
     """Translate a single sentence using Claude, with surrounding context."""
+    logger.debug(f"Translating sentence from {source_lang} to {target_lang}: {sentence[:50]}...")
     try:
         client = anthropic.Anthropic()
 
@@ -131,12 +148,17 @@ Return ONLY the translated sentence, nothing else. No quotes."""
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}]
         )
-        return response.content[0].text.strip()
+        result = response.content[0].text.strip()
+        logger.info(f"Translation complete: {source_lang} -> {target_lang}")
+        return result
     except anthropic.RateLimitError:
+        logger.warning(f"Rate limit hit during translation {source_lang} -> {target_lang}")
         raise TranslationError("Rate limit exceeded. Please wait and try again.")
     except anthropic.APIConnectionError:
+        logger.error(f"API connection error during translation {source_lang} -> {target_lang}")
         raise TranslationError("Network error. Check your connection.")
     except anthropic.APIError as e:
+        logger.error(f"API error during translation {source_lang} -> {target_lang}: {e.message}")
         raise TranslationError(f"API error: {e.message}")
 
 # --- Consistency Check ---
@@ -145,8 +167,10 @@ async def run_consistency_check():
     """Check all language versions for consistency and reconcile if needed."""
     global consistency_check_running
     if consistency_check_running:
+        logger.debug("Consistency check already running, skipping")
         return
 
+    logger.info("Starting consistency check")
     consistency_check_running = True
     try:
         # Read all documents
@@ -156,10 +180,14 @@ async def run_consistency_check():
         # Check if counts differ (indicates sync issue)
         counts = list(sentence_counts.values())
         if not counts or all(c == 0 for c in counts):
+            logger.debug("Empty documents, skipping consistency check")
             return  # Empty docs, nothing to reconcile
 
         if len(set(counts)) == 1:
+            logger.debug("All documents have same sentence count, no reconciliation needed")
             return  # All same count, assume in sync
+
+        logger.info(f"Sentence count mismatch detected: {sentence_counts}")
 
         # Notify clients that sync is starting
         await broadcast({"type": "consistency_check", "status": "started"})
@@ -219,8 +247,10 @@ Return your response in this exact JSON format (no other text):
                 })
 
         await broadcast({"type": "consistency_check", "status": "completed"})
+        logger.info("Consistency check completed successfully")
 
     except Exception as e:
+        logger.error(f"Consistency check failed: {e}")
         await broadcast({"type": "consistency_check", "status": "error", "error": str(e)})
     finally:
         consistency_check_running = False
@@ -286,6 +316,7 @@ async def broadcast_connection_stats():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     clients[ws] = "en"  # default language
+    logger.info(f"New WebSocket connection established. Total clients: {len(clients)}")
     await broadcast_connection_stats()
 
     try:
@@ -296,6 +327,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "load":
                 # Client wants to load a language version
                 lang = data.get("language", "en")
+                logger.debug(f"Client loading document for language: {lang}")
                 if clients[ws] != lang:
                     clients[ws] = lang
                     await broadcast_connection_stats()
@@ -307,6 +339,7 @@ async def websocket_endpoint(ws: WebSocket):
                 source_lang = data["language"]
                 sentence_idx = data["sentence_index"]
                 full_content = data["full_content"]
+                logger.info(f"Delete operation: sentence {sentence_idx} in {source_lang}")
 
                 # Save snapshot before making changes
                 save_snapshot("delete")
@@ -338,6 +371,7 @@ async def websocket_endpoint(ws: WebSocket):
                 sentence_idx = data["sentence_index"]
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
+                logger.info(f"Insert operation: sentence {sentence_idx} in {source_lang}")
 
                 # Save snapshot before making changes
                 save_snapshot("insert")
@@ -399,6 +433,7 @@ async def websocket_endpoint(ws: WebSocket):
                 sentence_idx = data["sentence_index"]
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
+                logger.info(f"Edit operation: sentence {sentence_idx} in {source_lang}")
 
                 # Save snapshot before making changes
                 save_snapshot("edit")
@@ -461,6 +496,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg_type == "undo":
                 # Revert to previous state
+                logger.info("Undo operation requested")
                 restored = undo_last()
                 if restored:
                     # Broadcast updated content to all clients
@@ -480,6 +516,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         clients.pop(ws, None)
+        logger.info(f"WebSocket connection closed. Total clients: {len(clients)}")
         await broadcast_connection_stats()
 
 # --- Static Files ---
@@ -492,4 +529,5 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
+    logger.info("Starting Babbel Docs server on 0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
