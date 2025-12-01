@@ -96,7 +96,7 @@
             ws.onopen = () => {
                 statusEl.textContent = 'Connected';
                 statusEl.className = 'connected';
-                ws.send(JSON.stringify({ type: 'load', language: currentLang }));
+                ws.send(JSON.stringify({ type: 'load', lang: currentLang }));
             };
 
             ws.onclose = () => {
@@ -128,32 +128,7 @@
                     }
                 }
 
-                if (msg.type === 'pending') {
-                    // Show original text (will be replaced when translation arrives)
-                    pendingBlocks[msg.index] = { text: msg.text, sourceLang: msg.source_lang };
-                    // Insert the pending text into editor at the right position
-                    insertPendingText(msg.index, msg.text);
-                }
             };
-        };
-
-        // Insert pending (untranslated) text at sentence index
-        const insertPendingText = (index, text) => {
-            const sentences = splitSentences(editor.value);
-            while (sentences.length <= index) {
-                sentences.push('');
-            }
-            // Mark it visually by wrapping (we'll use a simple marker)
-            sentences[index] = `[PENDING: ${text}]`;
-            editor.value = sentences.join('. ');
-            lastSentText = editor.value;
-        };
-
-        // Simple sentence splitter (matches backend logic)
-        const splitSentences = (text) => {
-            if (!text.trim()) return [];
-            // Split on . ! ? or newlines
-            return text.split(/[.!?\n]+/).map(s => s.trim()).filter(s => s);
         };
 
         // Send update when user stops typing
@@ -177,7 +152,7 @@
         langSelect.addEventListener('change', () => {
             currentLang = langSelect.value;
             if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'load', language: currentLang }));
+                ws.send(JSON.stringify({ type: 'load', lang: currentLang }));
             }
         });
 

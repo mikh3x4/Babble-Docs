@@ -1,13 +1,10 @@
 """
 Babbel Docs - Collaborative Translation Editor
-Simplified architecture with chunk-based document storage.
+Single document with merged language representation.
 """
-import os
 import re
 import json
-import asyncio
 import logging
-import time
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -27,96 +24,101 @@ app = FastAPI()
 DOCS_DIR = Path("docs")
 DOCS_DIR.mkdir(exist_ok=True)
 
-# Configurable sentence-ending characters
-SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f'  # ASCII + Chinese punctuation
-
+# Sentence-ending characters (configurable)
+SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f'
 LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
+
 clients: dict[WebSocket, str] = {}
 
-# --- Document as Chunks ---
-# Document is stored as JSON: {"chunks": [{"type": "content"|"separator", "text": "..."}]}
-# Alternates: content, separator, content, separator, ...
-# Separators are: sentence-enders OR newlines
+# --- Document Storage ---
+# Format: [{"en": "...", "pl": "...", "zh": "..."}, ".\n", {"en": "...", ...}, "!"]
+# Alternating: content dict, separator string, content dict, separator string, ...
 
-def get_doc_path(lang: str) -> Path:
-    return DOCS_DIR / f"{lang}.json"
+DOC_PATH = DOCS_DIR / "document.json"
 
-def text_to_chunks(text: str) -> list[dict]:
-    """Convert plain text to chunks (alternating content/separator)."""
-    if not text:
-        return []
-
-    chunks = []
-    # Pattern: match either sentence-ender (with optional following whitespace) or newlines
-    pattern = f'([{re.escape(SENTENCE_ENDERS)}]\\s*|\\n+)'
-    parts = re.split(pattern, text)
-
-    for i, part in enumerate(parts):
-        if not part:
-            continue
-        # Check if this is a separator
-        is_sep = bool(re.match(f'^[{re.escape(SENTENCE_ENDERS)}\\n\\s]+$', part))
-        chunk_type = "separator" if is_sep else "content"
-
-        # Merge consecutive same-type chunks
-        if chunks and chunks[-1]["type"] == chunk_type:
-            chunks[-1]["text"] += part
-        else:
-            chunks.append({"type": chunk_type, "text": part})
-
-    return chunks
-
-def chunks_to_text(chunks: list[dict]) -> str:
-    """Convert chunks back to plain text."""
-    return "".join(c["text"] for c in chunks)
-
-def get_content_chunks(chunks: list[dict]) -> list[tuple[int, dict]]:
-    """Get list of (index, chunk) for content chunks only."""
-    return [(i, c) for i, c in enumerate(chunks) if c["type"] == "content"]
-
-def read_doc(lang: str) -> list[dict]:
-    """Read document as chunks."""
-    path = get_doc_path(lang)
-    if path.exists():
+def load_doc() -> list:
+    """Load document as list of content dicts and separator strings."""
+    if DOC_PATH.exists():
         try:
-            data = json.loads(path.read_text())
-            return data.get("chunks", [])
+            return json.loads(DOC_PATH.read_text())
         except:
             pass
     return []
 
-def write_doc(lang: str, chunks: list[dict]):
-    """Write document as chunks."""
-    logger.debug(f"write_doc({lang}): {len(chunks)} chunks")
-    get_doc_path(lang).write_text(json.dumps({"chunks": chunks}, ensure_ascii=False))
+def save_doc(doc: list):
+    """Save document."""
+    logger.debug(f"save_doc: {len(doc)} items")
+    DOC_PATH.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
 
-def read_doc_text(lang: str) -> str:
-    """Read document as plain text."""
-    return chunks_to_text(read_doc(lang))
+def doc_to_text(doc: list, lang: str) -> str:
+    """Convert document to plain text for a specific language."""
+    parts = []
+    for item in doc:
+        if isinstance(item, dict):
+            parts.append(item.get(lang, ""))
+        else:
+            parts.append(item)  # separator string
+    return "".join(parts)
 
-def write_doc_text(lang: str, text: str):
-    """Write document from plain text."""
-    write_doc(lang, text_to_chunks(text))
+def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
+    """Parse text into document structure, preserving other languages from existing_doc."""
+    if not text:
+        return []
+
+    # Split text into content and separators
+    pattern = f'([{re.escape(SENTENCE_ENDERS)}]+\\s*|\\n+)'
+    parts = re.split(pattern, text)
+
+    new_doc = []
+    content_idx = 0
+
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+
+        # Check if separator
+        is_sep = bool(re.match(f'^[{re.escape(SENTENCE_ENDERS)}\\s\\n]+$', part))
+
+        if is_sep:
+            new_doc.append(part)
+        else:
+            # Content block - preserve other languages if they exist
+            content_dict = {lang: part}
+            if existing_doc:
+                # Find corresponding content block in existing doc
+                existing_contents = [item for item in existing_doc if isinstance(item, dict)]
+                if content_idx < len(existing_contents):
+                    for other_lang in LANGUAGES:
+                        if other_lang != lang and other_lang in existing_contents[content_idx]:
+                            content_dict[other_lang] = existing_contents[content_idx][other_lang]
+            new_doc.append(content_dict)
+            content_idx += 1
+
+    return new_doc
+
+def get_content_blocks(doc: list) -> list[dict]:
+    """Get just the content blocks (dicts) from document."""
+    return [item for item in doc if isinstance(item, dict)]
 
 # --- Translation ---
 
 def translate_block(block: str, prev_block: str, next_block: str,
                     prev_target: str, next_target: str,
                     source_lang: str, target_lang: str) -> str:
-    """Translate a content block with context from both languages."""
-    logger.info(f"Translating block from {source_lang} to {target_lang}")
+    """Translate a content block with context."""
+    logger.info(f"Translating: {source_lang} -> {target_lang}")
 
     client = anthropic.Anthropic()
-    prompt = f"""Translate a sentence from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}.
+    prompt = f"""Translate from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}.
 
-Source language context:
-Previous: {prev_block or '(none)'}
+Context (source language):
+Previous: {prev_block or '(start)'}
 TRANSLATE THIS: {block}
-Next: {next_block or '(none)'}
+Next: {next_block or '(end)'}
 
-Target language context (for style/consistency):
-Previous: {prev_target or '(none)'}
-Next: {next_target or '(none)'}
+Target language context:
+Previous: {prev_target or '(start)'}
+Next: {next_target or '(end)'}
 
 Return ONLY the translated sentence. No quotes, no explanation."""
 
@@ -125,14 +127,11 @@ Return ONLY the translated sentence. No quotes, no explanation."""
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
     )
-    result = response.content[0].text.strip()
-    logger.debug(f"Translation result: {result[:100]}")
-    return result
+    return response.content[0].text.strip()
 
 # --- Broadcasting ---
 
 async def broadcast(message: dict, exclude: WebSocket = None):
-    """Send to all clients."""
     for ws in list(clients.keys()):
         if ws != exclude:
             try:
@@ -141,11 +140,22 @@ async def broadcast(message: dict, exclude: WebSocket = None):
                 clients.pop(ws, None)
 
 async def broadcast_to_lang(lang: str, message: dict, exclude: WebSocket = None):
-    """Send to clients viewing specific language."""
     for ws, ws_lang in list(clients.items()):
         if ws_lang == lang and ws != exclude:
             try:
                 await ws.send_json(message)
+            except:
+                clients.pop(ws, None)
+
+async def send_doc_to_all(doc: list, exclude: WebSocket = None):
+    """Send document to all clients in their respective languages."""
+    for ws, lang in list(clients.items()):
+        if ws != exclude:
+            try:
+                await ws.send_json({
+                    "type": "doc",
+                    "text": doc_to_text(doc, lang)
+                })
             except:
                 clients.pop(ws, None)
 
@@ -156,8 +166,6 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     clients[ws] = "en"
     logger.info(f"Client connected. Total: {len(clients)}")
-
-    # Send connection count
     await broadcast({"type": "clients", "count": len(clients)})
 
     try:
@@ -167,161 +175,91 @@ async def websocket_endpoint(ws: WebSocket):
             logger.debug(f"Message: {msg_type}")
 
             if msg_type == "load":
-                lang = data.get("language", "en")
+                lang = data.get("lang", "en")
                 clients[ws] = lang
-                text = read_doc_text(lang)
-                await ws.send_json({"type": "doc", "lang": lang, "text": text})
+                doc = load_doc()
+                await ws.send_json({"type": "doc", "text": doc_to_text(doc, lang)})
                 await broadcast({"type": "clients", "count": len(clients)})
 
             elif msg_type == "update":
-                # Client sent full document text
                 source_lang = data["lang"]
                 new_text = data["text"]
-                old_chunks = read_doc(source_lang)
-                new_chunks = text_to_chunks(new_text)
 
-                # Save source immediately
-                write_doc(source_lang, new_chunks)
+                old_doc = load_doc()
+                new_doc = text_to_doc(new_text, source_lang, old_doc)
+
+                old_contents = get_content_blocks(old_doc)
+                new_contents = get_content_blocks(new_doc)
+
+                # Find what changed
+                changed_indices = []
+                for i in range(max(len(old_contents), len(new_contents))):
+                    old_text = old_contents[i].get(source_lang, "") if i < len(old_contents) else None
+                    new_text_i = new_contents[i].get(source_lang, "") if i < len(new_contents) else None
+                    if old_text != new_text_i:
+                        changed_indices.append(i)
+
+                # Save immediately (source language is already in new_doc)
+                save_doc(new_doc)
 
                 # Broadcast to same-language clients
                 await broadcast_to_lang(source_lang, {
-                    "type": "doc", "lang": source_lang, "text": new_text
+                    "type": "doc",
+                    "text": doc_to_text(new_doc, source_lang)
                 }, exclude=ws)
 
-                # Find which content block changed
-                old_contents = get_content_chunks(old_chunks)
-                new_contents = get_content_chunks(new_chunks)
-
-                # Simple diff: find first different content block
-                changed_idx = None
-                change_type = None  # 'edit', 'insert', 'delete'
-
-                if len(new_contents) > len(old_contents):
-                    change_type = 'insert'
-                    for i in range(len(old_contents)):
-                        if old_contents[i][1]["text"] != new_contents[i][1]["text"]:
-                            changed_idx = i
-                            break
-                    if changed_idx is None:
-                        changed_idx = len(old_contents)
-                elif len(new_contents) < len(old_contents):
-                    change_type = 'delete'
-                    for i in range(len(new_contents)):
-                        if old_contents[i][1]["text"] != new_contents[i][1]["text"]:
-                            changed_idx = i
-                            break
-                    if changed_idx is None:
-                        changed_idx = len(new_contents)
-                else:
-                    change_type = 'edit'
-                    for i in range(len(new_contents)):
-                        if old_contents[i][1]["text"] != new_contents[i][1]["text"]:
-                            changed_idx = i
-                            break
-
-                if changed_idx is None:
-                    # No content change (only separator change)
-                    # Propagate separator changes to all languages
-                    for target_lang in LANGUAGES:
-                        if target_lang == source_lang:
-                            continue
-                        # Just update separators, keep content
-                        target_chunks = read_doc(target_lang)
-                        # Copy separator pattern from source
-                        write_doc(target_lang, target_chunks)
-                        await broadcast_to_lang(target_lang, {
-                            "type": "doc", "lang": target_lang,
-                            "text": chunks_to_text(target_chunks)
-                        })
+                if not changed_indices:
+                    # Only separators changed - broadcast to all
+                    await send_doc_to_all(new_doc, exclude=ws)
                     continue
 
                 # Content changed - need to translate
-                logger.info(f"Content change: {change_type} at index {changed_idx}")
-
-                # Get context from source
-                prev_block = new_contents[changed_idx-1][1]["text"] if changed_idx > 0 else ""
-                next_block = new_contents[changed_idx+1][1]["text"] if changed_idx < len(new_contents)-1 else ""
-                changed_block = new_contents[changed_idx][1]["text"] if change_type != 'delete' else ""
-
-                # Notify other languages: show syncing
+                logger.info(f"Changed blocks: {changed_indices}")
                 await broadcast({"type": "syncing", "active": True})
 
-                # Send pending (original text in red) to other languages
-                for target_lang in LANGUAGES:
-                    if target_lang != source_lang and change_type != 'delete':
-                        await broadcast_to_lang(target_lang, {
-                            "type": "pending",
-                            "index": changed_idx,
-                            "text": changed_block,
-                            "source_lang": source_lang
-                        })
+                # Send pending (original text) to other languages
+                for idx in changed_indices:
+                    if idx < len(new_contents):
+                        original_text = new_contents[idx].get(source_lang, "")
+                        for target_lang in LANGUAGES:
+                            if target_lang != source_lang:
+                                # Put original text as placeholder
+                                new_contents[idx][target_lang] = f"[{original_text}]"
 
-                # Translate to each target language
-                for target_lang in LANGUAGES:
-                    if target_lang == source_lang:
+                # Rebuild and broadcast with placeholders
+                save_doc(new_doc)
+                await send_doc_to_all(new_doc, exclude=ws)
+
+                # Now translate each changed block
+                for idx in changed_indices:
+                    if idx >= len(new_contents):
                         continue
 
-                    target_chunks = read_doc(target_lang)
-                    target_contents = get_content_chunks(target_chunks)
+                    source_text = new_contents[idx].get(source_lang, "")
+                    if not source_text:
+                        continue
 
-                    # Get target context
-                    prev_target = target_contents[changed_idx-1][1]["text"] if changed_idx > 0 and changed_idx-1 < len(target_contents) else ""
-                    next_target = target_contents[changed_idx+1][1]["text"] if changed_idx+1 < len(target_contents) else ""
+                    # Get context
+                    prev_source = new_contents[idx-1].get(source_lang, "") if idx > 0 else ""
+                    next_source = new_contents[idx+1].get(source_lang, "") if idx < len(new_contents)-1 else ""
 
-                    if change_type == 'delete':
-                        # Remove the content block at changed_idx
-                        if changed_idx < len(target_contents):
-                            chunk_idx = target_contents[changed_idx][0]
-                            # Remove content and following separator if exists
-                            if chunk_idx < len(target_chunks):
-                                del target_chunks[chunk_idx]
-                                # Also remove following separator
-                                if chunk_idx < len(target_chunks) and target_chunks[chunk_idx]["type"] == "separator":
-                                    del target_chunks[chunk_idx]
+                    for target_lang in LANGUAGES:
+                        if target_lang == source_lang:
+                            continue
 
-                    elif change_type == 'insert':
-                        # Translate and insert
+                        prev_target = new_contents[idx-1].get(target_lang, "") if idx > 0 else ""
+                        next_target = new_contents[idx+1].get(target_lang, "") if idx < len(new_contents)-1 else ""
+
                         translated = translate_block(
-                            changed_block, prev_block, next_block,
+                            source_text, prev_source, next_source,
                             prev_target, next_target,
                             source_lang, target_lang
                         )
-                        # Find where to insert in target chunks
-                        if changed_idx == 0:
-                            insert_pos = 0
-                        elif changed_idx < len(target_contents):
-                            insert_pos = target_contents[changed_idx][0]
-                        else:
-                            insert_pos = len(target_chunks)
+                        new_contents[idx][target_lang] = translated
 
-                        # Insert content and separator
-                        target_chunks.insert(insert_pos, {"type": "content", "text": translated})
-                        # Copy separator from source if available
-                        source_sep_idx = new_contents[changed_idx][0] + 1
-                        if source_sep_idx < len(new_chunks) and new_chunks[source_sep_idx]["type"] == "separator":
-                            target_chunks.insert(insert_pos + 1, {"type": "separator", "text": new_chunks[source_sep_idx]["text"]})
-
-                    else:  # edit
-                        # Translate and replace
-                        translated = translate_block(
-                            changed_block, prev_block, next_block,
-                            prev_target, next_target,
-                            source_lang, target_lang
-                        )
-                        if changed_idx < len(target_contents):
-                            chunk_idx = target_contents[changed_idx][0]
-                            target_chunks[chunk_idx]["text"] = translated
-                        else:
-                            # Need to add new content
-                            target_chunks.append({"type": "content", "text": translated})
-
-                    write_doc(target_lang, target_chunks)
-                    await broadcast_to_lang(target_lang, {
-                        "type": "doc", "lang": target_lang,
-                        "text": chunks_to_text(target_chunks)
-                    })
-
-                # Done syncing
+                # Save and broadcast final translations
+                save_doc(new_doc)
+                await send_doc_to_all(new_doc)
                 await broadcast({"type": "syncing", "active": False})
 
     except WebSocketDisconnect:
