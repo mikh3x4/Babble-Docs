@@ -7,327 +7,88 @@
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: system-ui, -apple-system, sans-serif;
+            font-family: system-ui, sans-serif;
             max-width: 800px; margin: 0 auto; padding: 2rem;
             background: #f5f5f5;
         }
-        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+        header {
+            display: flex; justify-content: space-between;
+            align-items: center; margin-bottom: 1rem;
+        }
         h1 { font-size: 1.5rem; color: #333; }
-        select {
+        select, button {
             padding: 0.5rem 1rem; font-size: 1rem;
             border: 1px solid #ccc; border-radius: 4px;
+            margin-left: 0.5rem;
         }
-        .editor-container {
-            position: relative;
-            width: 100%;
-        }
-        #editor-highlight {
-            position: absolute; top: 0; left: 0; right: 0;
-            min-height: 400px; padding: 1rem;
-            font-size: 1rem; line-height: 1.6;
-            border: 2px solid transparent; border-radius: 8px;
-            background: white; white-space: pre-wrap; word-wrap: break-word;
-            pointer-events: none; overflow: hidden;
-            font-family: system-ui, -apple-system, sans-serif;
-        }
+        button { background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+
         #editor {
-            position: relative;
             width: 100%; min-height: 400px; padding: 1rem;
             font-size: 1rem; line-height: 1.6;
             border: 2px solid #ddd; border-radius: 8px;
-            background: transparent; resize: vertical;
-            font-family: system-ui, -apple-system, sans-serif;
+            background: white; resize: vertical;
+            font-family: inherit;
         }
         #editor:focus { outline: none; border-color: #007bff; }
-        .sentence-highlight {
-            background: #ffeb3b; border-radius: 2px;
-        }
-        .pending-translation {
-            background: #ffcccc; color: #cc0000; border-radius: 2px;
-        }
+
         #status {
             margin-top: 0.5rem; padding: 0.5rem;
             font-size: 0.875rem; color: #666;
         }
-        #connection-stats {
-            margin-top: 0.5rem; padding: 0.5rem;
-            font-size: 0.875rem; color: #007bff;
-        }
-        .translating { color: #ff6b00; font-weight: bold; }
         .connected { color: #28a745; }
         .disconnected { color: #dc3545; }
 
-        /* Sentence highlighting overlay */
-        #sentence-status {
-            margin-top: 0.5rem; padding: 0.75rem;
-            background: #fff3cd; border-radius: 4px;
-            display: none;
-        }
-        #sentence-status.active { display: block; }
-        #sentence-status.error { background: #f8d7da; color: #721c24; }
-        #retry-btn {
-            margin-left: 1rem; padding: 0.25rem 0.75rem;
-            background: #dc3545; color: white; border: none;
-            border-radius: 4px; cursor: pointer; font-size: 0.875rem;
-        }
-        #retry-btn:hover { background: #c82333; }
-        #undo-btn {
-            padding: 0.5rem 1rem; font-size: 1rem;
-            background: #6c757d; color: white; border: none;
-            border-radius: 4px; cursor: pointer; margin-left: 1rem;
-        }
-        #undo-btn:hover { background: #5a6268; }
-        .spinner {
-            display: inline-block; width: 12px; height: 12px;
-            border: 2px solid #ff6b00; border-top-color: transparent;
-            border-radius: 50%; animation: spin 1s linear infinite;
-            margin-right: 0.5rem;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        #sync-indicator {
+        /* Syncing indicator - always visible when active */
+        #syncing {
             position: fixed; top: 1rem; right: 1rem;
-            padding: 0.5rem 1rem; border-radius: 4px;
-            background: #17a2b8; color: white;
-            font-size: 0.875rem; display: none;
-            animation: pulse 1.5s ease-in-out infinite;
-            z-index: 9999;
+            padding: 0.75rem 1.5rem; border-radius: 4px;
+            background: #ff6b00; color: white;
+            font-weight: bold; font-size: 1rem;
+            display: none; z-index: 9999;
+            animation: pulse 1s ease-in-out infinite;
         }
-        #sync-indicator.active { display: block !important; }
-        #sync-indicator.error { background: #dc3545; animation: none; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        #syncing.active { display: block; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+        /* Pending translation highlight */
+        .pending {
+            background: #ffcccc; color: #cc0000;
+            padding: 2px 4px; border-radius: 2px;
+        }
     </style>
 </head>
 <body>
     <header>
         <h1>Babbel Docs</h1>
         <div>
+            <span id="clients">0 users</span>
             <select id="language">
                 <option value="en">English</option>
                 <option value="pl">Polski</option>
                 <option value="zh">中文</option>
             </select>
-            <button id="undo-btn">Undo</button>
         </div>
     </header>
 
-    <div class="editor-container">
-        <div id="editor-highlight"></div>
-        <textarea id="editor" placeholder="Start typing..."></textarea>
-    </div>
+    <textarea id="editor" placeholder="Start typing..."></textarea>
 
-    <div id="sentence-status">
-        <span class="spinner"></span>
-        <span id="status-text">Translating sentence...</span>
-        <button id="retry-btn" style="display:none;">Retry</button>
-    </div>
-
-    <div id="connection-stats"></div>
     <div id="status" class="disconnected">Disconnected</div>
-    <div id="sync-indicator">Syncing...</div>
+    <div id="syncing">Syncing...</div>
 
     <script>
         const editor = document.getElementById('editor');
-        const editorHighlight = document.getElementById('editor-highlight');
         const langSelect = document.getElementById('language');
         const statusEl = document.getElementById('status');
-        const sentenceStatus = document.getElementById('sentence-status');
-        const statusText = document.getElementById('status-text');
-        const connectionStats = document.getElementById('connection-stats');
-        const retryBtn = document.getElementById('retry-btn');
-        const undoBtn = document.getElementById('undo-btn');
-        const spinner = document.querySelector('.spinner');
-        const syncIndicator = document.getElementById('sync-indicator');
+        const clientsEl = document.getElementById('clients');
+        const syncingEl = document.getElementById('syncing');
 
         let ws = null;
-        let previousContent = '';
         let currentLang = 'en';
-        let translatingIndices = new Set();
-        let pendingTranslations = {};  // {index: {text, sourceLang}}
-        let lastError = null;
-
-        // Split text into sentences (matches backend logic)
-        // A sentence is anything separated by '.' or newline
-        // Supports ASCII and Chinese punctuation
-        const splitSentences = (text) => {
-            if (!text.trim()) return [];
-            // Split on sentence-ending punctuation OR newlines
-            return text.trim().split(/(?<=[.!?\u3002\uff01\uff1f])\s*|\n+/).filter(s => s.trim());
-        };
-
-        // Split text into sentences while preserving separators
-        // A sentence is anything separated by '.' or newline
-        // Supports ASCII and Chinese punctuation
-        const splitSentencesWithSeparators = (text) => {
-            if (!text.trim()) return { sentences: [], separators: [] };
-
-            const sentences = [];
-            const separators = [];
-
-            // Split by newlines first, then by sentence-ending punctuation within each line
-            // Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
-            const lines = text.trim().split('\n');
-
-            for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-                const line = lines[lineIdx].trim();
-                if (!line) continue;
-
-                const pattern = /(.*?[.!?\u3002\uff01\uff1f])(\s*)/gs;
-                const matches = [];
-                let match;
-                while ((match = pattern.exec(line)) !== null) {
-                    matches.push([match[1], match[2]]);
-                }
-
-                if (matches.length > 0) {
-                    for (let matchIdx = 0; matchIdx < matches.length; matchIdx++) {
-                        const [sentence, separator] = matches[matchIdx];
-                        const trimmedSentence = sentence.trim();
-                        if (trimmedSentence) {
-                            sentences.push(trimmedSentence);
-                            // Determine separator: if last match in line and not last line, use newline
-                            const isLastMatchInLine = matchIdx === matches.length - 1;
-                            const isLastLine = lineIdx === lines.length - 1;
-
-                            if (isLastMatchInLine && !isLastLine) {
-                                separators.push('\n');
-                            } else if (separator) {
-                                separators.push(' ');
-                            } else {
-                                separators.push('');
-                            }
-                        }
-                    }
-                } else {
-                    // No sentence-ending punctuation found in this line, treat line as one sentence
-                    if (line) {
-                        sentences.push(line);
-                        // Use newline separator if not the last line
-                        const isLastLine = lineIdx === lines.length - 1;
-                        if (!isLastLine) {
-                            separators.push('\n');
-                        } else {
-                            separators.push('');
-                        }
-                    }
-                }
-            }
-
-            // Ensure last separator is empty
-            if (separators.length > 0) {
-                separators[separators.length - 1] = '';
-            }
-
-            return { sentences, separators };
-        };
-
-        // Join sentences with proper spacing
-        const joinSentences = (sentences, separators = null) => {
-            if (!sentences || sentences.length === 0) return '';
-
-            if (!separators || separators.length !== sentences.length) {
-                return sentences.join(' ');
-            }
-
-            let result = '';
-            for (let i = 0; i < sentences.length; i++) {
-                result += sentences[i];
-                if (i < sentences.length - 1 && separators[i]) {
-                    result += separators[i];
-                }
-            }
-            return result;
-        };
-
-        // Apply pending translation: insert original text at sentence index
-        const applyPendingTranslation = (index, originalText) => {
-            const { sentences, separators } = splitSentencesWithSeparators(editor.value);
-            // Insert or replace at the given index
-            while (sentences.length <= index) {
-                sentences.push('');
-                separators.push(' ');
-            }
-            sentences[index] = originalText;
-            editor.value = joinSentences(sentences, separators);
-            previousContent = editor.value;
-            updateHighlightOverlay();
-        };
-
-        // Render highlight overlay with highlighted sentences
-        const updateHighlightOverlay = () => {
-            const text = editor.value;
-            const hasPending = Object.keys(pendingTranslations).length > 0;
-            if (!text.trim() || (translatingIndices.size === 0 && !hasPending)) {
-                editorHighlight.innerHTML = '';
-                return;
-            }
-            const { sentences, separators } = splitSentencesWithSeparators(text);
-            const htmlParts = sentences.map((s, i) => {
-                const escaped = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                let sentenceHtml;
-                if (pendingTranslations[i]) {
-                    sentenceHtml = `<span class="pending-translation">${escaped}</span>`;
-                } else if (translatingIndices.has(i)) {
-                    sentenceHtml = `<span class="sentence-highlight">${escaped}</span>`;
-                } else {
-                    sentenceHtml = escaped;
-                }
-                // Add separator after this sentence (convert newlines to <br> for HTML)
-                const sep = (i < sentences.length - 1 && separators[i]) ? separators[i] : '';
-                const htmlSep = sep === '\n\n' ? '<br><br>' : sep;
-                return sentenceHtml + htmlSep;
-            });
-            editorHighlight.innerHTML = htmlParts.join('');
-        };
-
-        // Find all sentences that changed between old and new text
-        // Returns an array of changes to handle multiple insertions/deletions
-        const findChangedSentences = (oldText, newText) => {
-            const oldSentences = splitSentences(oldText);
-            const newSentences = splitSentences(newText);
-            const changes = [];
-
-            // Detect deletion: fewer sentences than before
-            if (newSentences.length < oldSentences.length) {
-                for (let i = 0; i < newSentences.length; i++) {
-                    if (oldSentences[i] !== newSentences[i]) {
-                        return [{ type: 'delete', index: i }];
-                    }
-                }
-                return [{ type: 'delete', index: newSentences.length }];
-            }
-
-            // Detect insertion: more sentences than before
-            if (newSentences.length > oldSentences.length) {
-                const numInserted = newSentences.length - oldSentences.length;
-                // Find where the insertion starts
-                let insertStart = 0;
-                for (let i = 0; i < oldSentences.length; i++) {
-                    if (oldSentences[i] !== newSentences[i]) {
-                        insertStart = i;
-                        break;
-                    } else {
-                        insertStart = i + 1;
-                    }
-                }
-                // Return all inserted sentences
-                for (let i = 0; i < numInserted; i++) {
-                    changes.push({
-                        type: 'insert',
-                        index: insertStart + i,
-                        sentence: newSentences[insertStart + i]
-                    });
-                }
-                return changes;
-            }
-
-            // Same count: find edited sentence
-            for (let i = 0; i < newSentences.length; i++) {
-                if (oldSentences[i] !== newSentences[i]) {
-                    return [{ type: 'edit', index: i, sentence: newSentences[i] }];
-                }
-            }
-            return [];
-        };
+        let debounceTimer = null;
+        let lastSentText = '';
+        let pendingBlocks = {};  // {index: {text, sourceLang}}
 
         const connect = () => {
             ws = new WebSocket(`ws://${location.host}/ws`);
@@ -346,136 +107,70 @@
 
             ws.onmessage = (e) => {
                 const msg = JSON.parse(e.data);
+                console.log('Received:', msg);
 
-                if (msg.type === 'content' && msg.language === currentLang) {
-                    // Update editor - translation complete replaces pending
-                    editor.value = msg.content;
-                    previousContent = msg.content;
-                    updateHighlightOverlay();
+                if (msg.type === 'doc' && msg.lang === currentLang) {
+                    editor.value = msg.text;
+                    lastSentText = msg.text;
+                    pendingBlocks = {};  // Clear pending on full doc update
                 }
 
-                if (msg.type === 'pending_translation') {
-                    // Show original text immediately, highlighted red
-                    pendingTranslations[msg.sentence_index] = {
-                        text: msg.original_text,
-                        sourceLang: msg.source_language
-                    };
-                    applyPendingTranslation(msg.sentence_index, msg.original_text);
-                    updateTranslatingStatus();
+                if (msg.type === 'clients') {
+                    clientsEl.textContent = `${msg.count} user${msg.count !== 1 ? 's' : ''}`;
                 }
 
-                if (msg.type === 'translating') {
-                    translatingIndices.add(msg.sentence_index);
-                    updateTranslatingStatus();
-                }
-
-                if (msg.type === 'translation_complete') {
-                    translatingIndices.delete(msg.sentence_index);
-                    delete pendingTranslations[msg.sentence_index];
-                    updateTranslatingStatus();
-                }
-
-                if (msg.type === 'translation_error') {
-                    translatingIndices.delete(msg.sentence_index);
-                    lastError = { index: msg.sentence_index, error: msg.error };
-                    showError(msg.error);
-                }
-
-                if (msg.type === 'connection_stats') {
-                    const breakdown = Object.entries(msg.by_language)
-                        .map(([lang, count]) => `${count} ${lang}`)
-                        .join(', ');
-                    connectionStats.textContent = `${msg.total} user${msg.total !== 1 ? 's' : ''} online (${breakdown})`;
-                }
-
-                if (msg.type === 'consistency_check') {
-                    if (msg.status === 'started') {
-                        syncIndicator.classList.add('active');
-                        syncIndicator.classList.remove('error');
-                        syncIndicator.textContent = 'Syncing...';
-                    } else if (msg.status === 'completed') {
-                        // Hide immediately when complete (no "Synced!" message)
-                        syncIndicator.classList.remove('active');
-                    } else if (msg.status === 'error') {
-                        syncIndicator.classList.add('error');
-                        syncIndicator.textContent = 'Sync failed';
-                        setTimeout(() => {
-                            syncIndicator.classList.remove('active', 'error');
-                        }, 3000);
+                if (msg.type === 'syncing') {
+                    if (msg.active) {
+                        syncingEl.classList.add('active');
+                    } else {
+                        syncingEl.classList.remove('active');
+                        pendingBlocks = {};
                     }
+                }
+
+                if (msg.type === 'pending') {
+                    // Show original text (will be replaced when translation arrives)
+                    pendingBlocks[msg.index] = { text: msg.text, sourceLang: msg.source_lang };
+                    // Insert the pending text into editor at the right position
+                    insertPendingText(msg.index, msg.text);
                 }
             };
         };
 
-        const updateTranslatingStatus = () => {
-            if (translatingIndices.size > 0) {
-                sentenceStatus.classList.add('active');
-                sentenceStatus.classList.remove('error');
-                spinner.style.display = 'inline-block';
-                retryBtn.style.display = 'none';
-                const indices = [...translatingIndices].join(', ');
-                statusText.textContent = `Translating sentence ${indices}...`;
-            } else if (!lastError) {
-                sentenceStatus.classList.remove('active');
-                sentenceStatus.classList.remove('error');
-            }
-            updateHighlightOverlay();
-        };
-
-        const showError = (error) => {
-            sentenceStatus.classList.add('active', 'error');
-            spinner.style.display = 'none';
-            retryBtn.style.display = 'inline-block';
-            statusText.textContent = `Translation failed: ${error}`;
-            updateHighlightOverlay();
-        };
-
-        retryBtn.addEventListener('click', () => {
-            if (!lastError || ws?.readyState !== WebSocket.OPEN) return;
+        // Insert pending (untranslated) text at sentence index
+        const insertPendingText = (index, text) => {
             const sentences = splitSentences(editor.value);
-            const idx = lastError.index;
-            const sentence = sentences[idx];
-            if (!sentence) return;
+            while (sentences.length <= index) {
+                sentences.push('');
+            }
+            // Mark it visually by wrapping (we'll use a simple marker)
+            sentences[index] = `[PENDING: ${text}]`;
+            editor.value = sentences.join('. ');
+            lastSentText = editor.value;
+        };
 
-            sentenceStatus.classList.remove('error');
-            retryBtn.style.display = 'none';
-            lastError = null;
+        // Simple sentence splitter (matches backend logic)
+        const splitSentences = (text) => {
+            if (!text.trim()) return [];
+            // Split on . ! ? or newlines
+            return text.split(/[.!?\n]+/).map(s => s.trim()).filter(s => s);
+        };
 
-            ws.send(JSON.stringify({
-                type: 'edit',
-                language: currentLang,
-                sentence_index: idx,
-                new_sentence: sentence,
-                full_content: editor.value
-            }));
-        });
-
-        // Send edit when user stops typing (debounced)
-        let editTimeout = null;
+        // Send update when user stops typing
         editor.addEventListener('input', () => {
-            updateHighlightOverlay();
-            clearTimeout(editTimeout);
-            editTimeout = setTimeout(() => {
-                const changes = findChangedSentences(previousContent, editor.value);
-                if (changes.length > 0 && ws?.readyState === WebSocket.OPEN) {
-                    // Send all changes (handles multiple sentence insertions)
-                    for (const change of changes) {
-                        ws.send(JSON.stringify({
-                            type: change.type,
-                            language: currentLang,
-                            sentence_index: change.index,
-                            new_sentence: change.sentence,
-                            full_content: editor.value
-                        }));
-                    }
-                    previousContent = editor.value;
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                const text = editor.value;
+                if (text !== lastSentText && ws?.readyState === WebSocket.OPEN) {
+                    console.log('Sending update');
+                    ws.send(JSON.stringify({
+                        type: 'update',
+                        lang: currentLang,
+                        text: text
+                    }));
+                    lastSentText = text;
                 }
             }, 500);
-        });
-
-        // Sync scroll between editor and highlight overlay
-        editor.addEventListener('scroll', () => {
-            editorHighlight.scrollTop = editor.scrollTop;
         });
 
         // Language switching
@@ -483,13 +178,6 @@
             currentLang = langSelect.value;
             if (ws?.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'load', language: currentLang }));
-            }
-        });
-
-        // Undo button
-        undoBtn.addEventListener('click', () => {
-            if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'undo' }));
             }
         });
 

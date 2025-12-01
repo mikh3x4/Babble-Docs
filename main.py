@@ -1,12 +1,13 @@
 """
 Babbel Docs - Collaborative Translation Editor
-A single-file backend serving a real-time translated document editor.
+Simplified architecture with chunk-based document storage.
 """
 import os
 import re
 import json
 import asyncio
 import logging
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -14,713 +15,319 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import anthropic
 
-# Configure logging to write to both console and file
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler('babbel.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler('babbel.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
 app = FastAPI()
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Babbel Docs server starting up")
-    logger.info(f"Documents directory: {DOCS_DIR.absolute()}")
-    logger.info(f"Supported languages: {list(LANGUAGES.keys())}")
-    asyncio.create_task(idle_check_loop())
-    logger.debug("Idle check background task started")
-
 DOCS_DIR = Path("docs")
 DOCS_DIR.mkdir(exist_ok=True)
-HISTORY_FILE = Path("edit_history.json")
-LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 
-# Connected WebSocket clients: {websocket: language}
+# Configurable sentence-ending characters
+SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f'  # ASCII + Chinese punctuation
+
+LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 clients: dict[WebSocket, str] = {}
 
-# Idle consistency check state
-last_activity_time: float = 0
-last_edited_language: str = "en"  # Track which language was most recently edited
-IDLE_THRESHOLD_SECONDS = 30
-consistency_check_running = False
-
-# --- Document Storage ---
+# --- Document as Chunks ---
+# Document is stored as JSON: {"chunks": [{"type": "content"|"separator", "text": "..."}]}
+# Alternates: content, separator, content, separator, ...
+# Separators are: sentence-enders OR newlines
 
 def get_doc_path(lang: str) -> Path:
-    return DOCS_DIR / f"{lang}.txt"
+    return DOCS_DIR / f"{lang}.json"
 
-def read_doc(lang: str) -> str:
+def text_to_chunks(text: str) -> list[dict]:
+    """Convert plain text to chunks (alternating content/separator)."""
+    if not text:
+        return []
+
+    chunks = []
+    # Pattern: match either sentence-ender (with optional following whitespace) or newlines
+    pattern = f'([{re.escape(SENTENCE_ENDERS)}]\\s*|\\n+)'
+    parts = re.split(pattern, text)
+
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        # Check if this is a separator
+        is_sep = bool(re.match(f'^[{re.escape(SENTENCE_ENDERS)}\\n\\s]+$', part))
+        chunk_type = "separator" if is_sep else "content"
+
+        # Merge consecutive same-type chunks
+        if chunks and chunks[-1]["type"] == chunk_type:
+            chunks[-1]["text"] += part
+        else:
+            chunks.append({"type": chunk_type, "text": part})
+
+    return chunks
+
+def chunks_to_text(chunks: list[dict]) -> str:
+    """Convert chunks back to plain text."""
+    return "".join(c["text"] for c in chunks)
+
+def get_content_chunks(chunks: list[dict]) -> list[tuple[int, dict]]:
+    """Get list of (index, chunk) for content chunks only."""
+    return [(i, c) for i, c in enumerate(chunks) if c["type"] == "content"]
+
+def read_doc(lang: str) -> list[dict]:
+    """Read document as chunks."""
     path = get_doc_path(lang)
-    content = path.read_text() if path.exists() else ""
-    preview = content[:100] + "..." if len(content) > 100 else content
-    logger.debug(f"read_doc({lang}): {len(content)} chars, preview='{preview}'")
-    return content
-
-def write_doc(lang: str, content: str):
-    preview = content[:100] + "..." if len(content) > 100 else content
-    logger.debug(f"write_doc({lang}): {len(content)} chars, preview='{preview}'")
-    get_doc_path(lang).write_text(content)
-
-# --- Edit History ---
-
-def load_history() -> list:
-    if HISTORY_FILE.exists():
-        return json.loads(HISTORY_FILE.read_text())
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            return data.get("chunks", [])
+        except:
+            pass
     return []
 
-def save_history(history: list):
-    HISTORY_FILE.write_text(json.dumps(history, indent=2))
+def write_doc(lang: str, chunks: list[dict]):
+    """Write document as chunks."""
+    logger.debug(f"write_doc({lang}): {len(chunks)} chunks")
+    get_doc_path(lang).write_text(json.dumps({"chunks": chunks}, ensure_ascii=False))
 
-def save_snapshot(operation: str):
-    """Save current state of all documents before an operation."""
-    from datetime import datetime
-    snapshot = {
-        "timestamp": datetime.now().isoformat(),
-        "operation": operation,
-        "documents": {lang: read_doc(lang) for lang in LANGUAGES}
-    }
-    history = load_history()
-    history.append(snapshot)
-    # Keep last 50 entries to avoid unbounded growth
-    save_history(history[-50:])
+def read_doc_text(lang: str) -> str:
+    """Read document as plain text."""
+    return chunks_to_text(read_doc(lang))
 
-def undo_last() -> dict | None:
-    """Revert to the previous state. Returns the restored documents or None."""
-    history = load_history()
-    if len(history) < 1:
-        return None
-    # Pop the last entry (current state before most recent edit) and restore it
-    history.pop()  # Remove the most recent snapshot
-    if not history:
-        save_history([])
-        return None
-    previous = history[-1]
-    for lang, content in previous["documents"].items():
-        write_doc(lang, content)
-    save_history(history)
-    return previous["documents"]
-
-def split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Handles ., newlines, and Chinese punctuation.
-
-    A sentence is anything separated by '.' or newline.
-    Returns a list of sentences. Use split_sentences_with_separators() if you
-    need to preserve original whitespace/formatting.
-    """
-    if not text.strip():
-        logger.debug(f"split_sentences: empty text, returning []")
-        return []
-    # Split on sentence-ending punctuation (ASCII and Chinese) OR newlines
-    # Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
-    parts = re.split(r'(?<=[.!?\u3002\uff01\uff1f])\s*|\n+', text.strip())
-    result = [p for p in parts if p.strip()]
-    logger.debug(f"split_sentences: {len(result)} sentences from {len(text)} chars")
-    return result
-
-def split_sentences_with_separators(text: str) -> tuple[list[str], list[str]]:
-    """Split text into sentences while preserving the separators between them.
-
-    A sentence is anything separated by '.' or newline.
-
-    Returns:
-        tuple of (sentences, separators) where separators[i] is the whitespace
-        that appeared after sentences[i]. The last separator is always empty string.
-    """
-    if not text.strip():
-        logger.debug(f"split_sentences_with_separators: empty text, returning ([], [])")
-        return [], []
-
-    sentences = []
-    separators = []
-
-    # Split by newlines first, then by sentence-ending punctuation within each line
-    # Chinese punctuation: \u3002 (full stop), \uff01 (exclamation), \uff1f (question mark)
-    lines = text.strip().split('\n')
-
-    for line_idx, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
-
-        # Pattern: sentence ending with .!? or Chinese punctuation, followed by optional whitespace
-        pattern = r'(.*?[.!?\u3002\uff01\uff1f])(\s*)'
-        matches = re.findall(pattern, line, re.DOTALL)
-
-        if matches:
-            for match_idx, (sentence, separator) in enumerate(matches):
-                sentence = sentence.strip()
-                if sentence:
-                    sentences.append(sentence)
-                    # Determine separator: if last match in line and not last line, use newline
-                    is_last_match_in_line = match_idx == len(matches) - 1
-                    is_last_line = line_idx == len(lines) - 1
-
-                    if is_last_match_in_line and not is_last_line:
-                        separators.append('\n')
-                    elif separator:
-                        separators.append(' ')
-                    else:
-                        separators.append('')
-        else:
-            # No sentence-ending punctuation found in this line, treat line as one sentence
-            if line:
-                sentences.append(line)
-                # Use newline separator if not the last line
-                is_last_line = line_idx == len(lines) - 1
-                if not is_last_line:
-                    separators.append('\n')
-                else:
-                    separators.append('')
-
-    # Ensure last separator is empty (nothing after last sentence)
-    if separators:
-        separators[-1] = ''
-
-    logger.debug(f"split_sentences_with_separators: {len(sentences)} sentences from {len(text)} chars")
-    return sentences, separators
-
-def join_sentences(sentences: list[str], separators: list[str] = None) -> str:
-    """Join sentences back together with proper spacing.
-
-    Args:
-        sentences: List of sentence strings
-        separators: Optional list of separators between sentences. If not provided,
-                   sentences are joined with single spaces.
-
-    Returns:
-        Joined text with proper spacing.
-    """
-    if not sentences:
-        return ""
-
-    if separators is None or len(separators) != len(sentences):
-        # Default behavior: join with single space
-        return " ".join(sentences)
-
-    # Use provided separators
-    result = []
-    for i, sentence in enumerate(sentences):
-        result.append(sentence)
-        if i < len(sentences) - 1 and separators[i]:
-            result.append(separators[i])
-
-    return "".join(result)
-
-def get_context(sentences: list[str], idx: int, window: int = 5) -> tuple[list[str], str, list[str]]:
-    """Get sentences before, the target sentence, and sentences after."""
-    before = sentences[max(0, idx - window):idx]
-    target = sentences[idx] if idx < len(sentences) else ""
-    after = sentences[idx + 1:idx + 1 + window]
-    logger.debug(f"get_context: idx={idx}, before={len(before)} sentences, target='{target[:50]}...', after={len(after)} sentences")
-    return before, target, after
+def write_doc_text(lang: str, text: str):
+    """Write document from plain text."""
+    write_doc(lang, text_to_chunks(text))
 
 # --- Translation ---
 
-class TranslationError(Exception):
-    """Raised when translation fails."""
-    pass
+def translate_block(block: str, prev_block: str, next_block: str,
+                    prev_target: str, next_target: str,
+                    source_lang: str, target_lang: str) -> str:
+    """Translate a content block with context from both languages."""
+    logger.info(f"Translating block from {source_lang} to {target_lang}")
 
-def translate_sentence(sentence: str, context_before: list[str], context_after: list[str],
-                       source_lang: str, target_lang: str) -> str:
-    """Translate a single sentence using Claude, with surrounding context."""
-    logger.debug(f"Translating sentence from {source_lang} to {target_lang}: {sentence[:50]}...")
-    try:
-        client = anthropic.Anthropic()
+    client = anthropic.Anthropic()
+    prompt = f"""Translate a sentence from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}.
 
-        context_text = ""
-        if context_before:
-            context_text += f"Previous sentences (for context only):\n{join_sentences(context_before)}\n\n"
-        if context_after:
-            context_text += f"Following sentences (for context only):\n{join_sentences(context_after)}\n\n"
+Source language context:
+Previous: {prev_block or '(none)'}
+TRANSLATE THIS: {block}
+Next: {next_block or '(none)'}
 
-        prompt = f"""{context_text}Translate this single sentence from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}:
-"{sentence}"
+Target language context (for style/consistency):
+Previous: {prev_target or '(none)'}
+Next: {next_target or '(none)'}
 
-Return ONLY the translated sentence, nothing else. No quotes."""
+Return ONLY the translated sentence. No quotes, no explanation."""
 
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        result = response.content[0].text.strip()
-        logger.info(f"Translation complete: {source_lang} -> {target_lang}")
-        return result
-    except anthropic.RateLimitError:
-        logger.warning(f"Rate limit hit during translation {source_lang} -> {target_lang}")
-        raise TranslationError("Rate limit exceeded. Please wait and try again.")
-    except anthropic.APIConnectionError:
-        logger.error(f"API connection error during translation {source_lang} -> {target_lang}")
-        raise TranslationError("Network error. Check your connection.")
-    except anthropic.APIError as e:
-        logger.error(f"API error during translation {source_lang} -> {target_lang}: {e.message}")
-        raise TranslationError(f"API error: {e.message}")
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    result = response.content[0].text.strip()
+    logger.debug(f"Translation result: {result[:100]}")
+    return result
 
-# --- Consistency Check ---
-
-async def run_consistency_check():
-    """Check all language versions for consistency and reconcile if needed.
-
-    Uses the most recently edited language as the source of truth, translating
-    its content to all other languages. This respects intentional deletions
-    rather than merging all content together.
-    """
-    global consistency_check_running
-    if consistency_check_running:
-        logger.debug("Consistency check already running, skipping")
-        return
-
-    logger.info("Starting consistency check")
-    consistency_check_running = True
-    try:
-        # Read all documents
-        docs = {lang: read_doc(lang) for lang in LANGUAGES}
-        sentence_counts = {lang: len(split_sentences(content)) for lang, content in docs.items()}
-
-        # Check if counts differ (indicates sync issue)
-        counts = list(sentence_counts.values())
-        if not counts or all(c == 0 for c in counts):
-            logger.debug("Empty documents, skipping consistency check")
-            return  # Empty docs, nothing to reconcile
-
-        if len(set(counts)) == 1:
-            logger.debug("All documents have same sentence count, no reconciliation needed")
-            return  # All same count, assume in sync
-
-        logger.info(f"Sentence count mismatch detected: {sentence_counts}")
-        logger.info(f"Using {last_edited_language} as source of truth (most recently edited)")
-
-        # Notify clients that sync is starting
-        logger.info("Broadcasting consistency_check status: started")
-        await broadcast({"type": "consistency_check", "status": "started"})
-
-        # Use the most recently edited language as source of truth
-        source_lang = last_edited_language
-        source_content = docs[source_lang]
-        source_sentences = split_sentences(source_content)
-
-        if not source_sentences:
-            logger.debug(f"Source language {source_lang} is empty, clearing all documents")
-            # Save snapshot before clearing
-            save_snapshot("consistency_check")
-            for lang in LANGUAGES:
-                write_doc(lang, "")
-                await broadcast_to_language(lang, {
-                    "type": "content",
-                    "language": lang,
-                    "content": ""
-                })
-            logger.info("Broadcasting consistency_check status: completed")
-            await broadcast({"type": "consistency_check", "status": "completed"})
-            logger.info("Consistency check completed - all documents cleared")
-            return
-
-        # Use Claude to translate the source to other languages
-        client = anthropic.Anthropic()
-
-        prompt = f"""The {LANGUAGES[source_lang]} version of a document is the authoritative version.
-Translate it to the other languages while preserving the exact same number of sentences.
-
-=== {LANGUAGES[source_lang]} (SOURCE - this is authoritative) ===
-{source_content}
-
-Translate the above to {', '.join(LANGUAGES[lang] for lang in LANGUAGES if lang != source_lang)}.
-Each translation must have exactly {len(source_sentences)} sentences, matching the source.
-
-Return your response in this exact JSON format (no other text):
-{{
-{', '.join(f'  "{lang}": "Full {LANGUAGES[lang]} text here..."' for lang in LANGUAGES if lang != source_lang)}
-}}"""
-
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        # Parse response
-        response_text = response.content[0].text.strip()
-        # Extract JSON from response (handle potential markdown code blocks)
-        if "```" in response_text:
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-
-        translations = json.loads(response_text)
-
-        # Save snapshot before reconciliation
-        save_snapshot("consistency_check")
-
-        # Keep the source language as-is, update others with translations
-        for lang in LANGUAGES:
-            if lang == source_lang:
-                # Broadcast the source content to ensure clients are in sync
-                await broadcast_to_language(lang, {
-                    "type": "content",
-                    "language": lang,
-                    "content": source_content
-                })
-            elif lang in translations:
-                content = translations[lang]
-                write_doc(lang, content)
-                await broadcast_to_language(lang, {
-                    "type": "content",
-                    "language": lang,
-                    "content": content
-                })
-
-        logger.info("Broadcasting consistency_check status: completed")
-        await broadcast({"type": "consistency_check", "status": "completed"})
-        logger.info("Consistency check completed successfully")
-
-    except Exception as e:
-        logger.error(f"Consistency check failed: {e}")
-        logger.info("Broadcasting consistency_check status: error")
-        await broadcast({"type": "consistency_check", "status": "error", "error": str(e)})
-    finally:
-        consistency_check_running = False
-
-async def idle_check_loop():
-    """Background task that triggers consistency check after idle period."""
-    global last_activity_time
-    import time
-
-    while True:
-        await asyncio.sleep(5)  # Check every 5 seconds
-
-        if last_activity_time == 0:
-            continue
-
-        elapsed = time.time() - last_activity_time
-        logger.debug(f"idle_check_loop: elapsed={elapsed:.1f}s, threshold={IDLE_THRESHOLD_SECONDS}s, check_running={consistency_check_running}")
-        if elapsed >= IDLE_THRESHOLD_SECONDS and not consistency_check_running:
-            logger.info(f"idle_check_loop: idle threshold reached ({elapsed:.1f}s), triggering consistency check")
-            last_activity_time = 0  # Reset to prevent repeated checks
-            await run_consistency_check()
-
-def update_activity(edited_lang: str = None):
-    """Update the last activity timestamp and optionally track which language was edited."""
-    global last_activity_time, last_edited_language
-    import time
-    last_activity_time = time.time()
-    if edited_lang:
-        last_edited_language = edited_lang
-    logger.debug(f"update_activity: timestamp set to {last_activity_time}, last_edited_language={last_edited_language}")
-
-# --- WebSocket Broadcasting ---
+# --- Broadcasting ---
 
 async def broadcast(message: dict, exclude: WebSocket = None):
-    """Send message to all connected clients except excluded one."""
-    target_count = len([ws for ws in clients if ws != exclude])
-    logger.debug(f"broadcast: type={message.get('type')}, to {target_count} clients (excluding 1: {exclude is not None})")
-    dead = []
-    for ws in clients:
+    """Send to all clients."""
+    for ws in list(clients.keys()):
         if ws != exclude:
             try:
                 await ws.send_json(message)
             except:
-                dead.append(ws)
-    if dead:
-        logger.debug(f"broadcast: removed {len(dead)} dead connections")
-    for ws in dead:
-        clients.pop(ws, None)
+                clients.pop(ws, None)
 
-async def broadcast_to_language(lang: str, message: dict, exclude: WebSocket = None):
-    """Send message only to clients viewing a specific language."""
-    target_count = len([ws for ws, ws_lang in clients.items() if ws_lang == lang and ws != exclude])
-    logger.debug(f"broadcast_to_language({lang}): type={message.get('type')}, to {target_count} clients")
+async def broadcast_to_lang(lang: str, message: dict, exclude: WebSocket = None):
+    """Send to clients viewing specific language."""
     for ws, ws_lang in list(clients.items()):
         if ws_lang == lang and ws != exclude:
             try:
                 await ws.send_json(message)
             except:
-                logger.debug(f"broadcast_to_language({lang}): removed dead connection")
                 clients.pop(ws, None)
-
-async def broadcast_connection_stats():
-    """Broadcast current connection stats to all clients."""
-    from collections import Counter
-    lang_counts = Counter(clients.values())
-    logger.debug(f"broadcast_connection_stats: total={len(clients)}, by_language={dict(lang_counts)}")
-    await broadcast({
-        "type": "connection_stats",
-        "total": len(clients),
-        "by_language": dict(lang_counts)
-    })
 
 # --- WebSocket Handler ---
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    clients[ws] = "en"  # default language
-    logger.info(f"New WebSocket connection established. Total clients: {len(clients)}")
-    await broadcast_connection_stats()
+    clients[ws] = "en"
+    logger.info(f"Client connected. Total: {len(clients)}")
+
+    # Send connection count
+    await broadcast({"type": "clients", "count": len(clients)})
 
     try:
         while True:
             data = json.loads(await ws.receive_text())
             msg_type = data.get("type")
-            logger.debug(f"Received message: type={msg_type}, data keys={list(data.keys())}")
+            logger.debug(f"Message: {msg_type}")
 
             if msg_type == "load":
-                # Client wants to load a language version
                 lang = data.get("language", "en")
-                logger.debug(f"Client loading document for language: {lang}")
-                if clients[ws] != lang:
-                    clients[ws] = lang
-                    await broadcast_connection_stats()
-                await ws.send_json({"type": "content", "language": lang, "content": read_doc(lang)})
+                clients[ws] = lang
+                text = read_doc_text(lang)
+                await ws.send_json({"type": "doc", "lang": lang, "text": text})
+                await broadcast({"type": "clients", "count": len(clients)})
 
-            elif msg_type == "delete":
-                # Client deleted a sentence
-                source_lang = data["language"]
-                update_activity(source_lang)
-                sentence_idx = data["sentence_index"]
-                full_content = data["full_content"]
-                logger.info(f"Delete operation: sentence {sentence_idx} in {source_lang}")
-                logger.debug(f"Delete: full_content length={len(full_content)}")
+            elif msg_type == "update":
+                # Client sent full document text
+                source_lang = data["lang"]
+                new_text = data["text"]
+                old_chunks = read_doc(source_lang)
+                new_chunks = text_to_chunks(new_text)
 
-                # Save snapshot before making changes
-                save_snapshot("delete")
+                # Save source immediately
+                write_doc(source_lang, new_chunks)
 
-                # Save the source language
-                write_doc(source_lang, full_content)
-
-                # Broadcast the updated content to all clients viewing the source language
-                await broadcast_to_language(source_lang, {
-                    "type": "content",
-                    "language": source_lang,
-                    "content": full_content
+                # Broadcast to same-language clients
+                await broadcast_to_lang(source_lang, {
+                    "type": "doc", "lang": source_lang, "text": new_text
                 }, exclude=ws)
 
-                # Delete the same sentence from all other languages
+                # Find which content block changed
+                old_contents = get_content_chunks(old_chunks)
+                new_contents = get_content_chunks(new_chunks)
+
+                # Simple diff: find first different content block
+                changed_idx = None
+                change_type = None  # 'edit', 'insert', 'delete'
+
+                if len(new_contents) > len(old_contents):
+                    change_type = 'insert'
+                    for i in range(len(old_contents)):
+                        if old_contents[i][1]["text"] != new_contents[i][1]["text"]:
+                            changed_idx = i
+                            break
+                    if changed_idx is None:
+                        changed_idx = len(old_contents)
+                elif len(new_contents) < len(old_contents):
+                    change_type = 'delete'
+                    for i in range(len(new_contents)):
+                        if old_contents[i][1]["text"] != new_contents[i][1]["text"]:
+                            changed_idx = i
+                            break
+                    if changed_idx is None:
+                        changed_idx = len(new_contents)
+                else:
+                    change_type = 'edit'
+                    for i in range(len(new_contents)):
+                        if old_contents[i][1]["text"] != new_contents[i][1]["text"]:
+                            changed_idx = i
+                            break
+
+                if changed_idx is None:
+                    # No content change (only separator change)
+                    # Propagate separator changes to all languages
+                    for target_lang in LANGUAGES:
+                        if target_lang == source_lang:
+                            continue
+                        # Just update separators, keep content
+                        target_chunks = read_doc(target_lang)
+                        # Copy separator pattern from source
+                        write_doc(target_lang, target_chunks)
+                        await broadcast_to_lang(target_lang, {
+                            "type": "doc", "lang": target_lang,
+                            "text": chunks_to_text(target_chunks)
+                        })
+                    continue
+
+                # Content changed - need to translate
+                logger.info(f"Content change: {change_type} at index {changed_idx}")
+
+                # Get context from source
+                prev_block = new_contents[changed_idx-1][1]["text"] if changed_idx > 0 else ""
+                next_block = new_contents[changed_idx+1][1]["text"] if changed_idx < len(new_contents)-1 else ""
+                changed_block = new_contents[changed_idx][1]["text"] if change_type != 'delete' else ""
+
+                # Notify other languages: show syncing
+                await broadcast({"type": "syncing", "active": True})
+
+                # Send pending (original text in red) to other languages
+                for target_lang in LANGUAGES:
+                    if target_lang != source_lang and change_type != 'delete':
+                        await broadcast_to_lang(target_lang, {
+                            "type": "pending",
+                            "index": changed_idx,
+                            "text": changed_block,
+                            "source_lang": source_lang
+                        })
+
+                # Translate to each target language
                 for target_lang in LANGUAGES:
                     if target_lang == source_lang:
                         continue
 
-                    target_sentences, target_separators = split_sentences_with_separators(read_doc(target_lang))
-                    logger.debug(f"Delete: {target_lang} has {len(target_sentences)} sentences, deleting idx {sentence_idx}")
-                    if sentence_idx < len(target_sentences):
-                        deleted_sentence = target_sentences[sentence_idx]
-                        logger.debug(f"Delete: removing sentence '{deleted_sentence[:50]}...' from {target_lang}")
-                        del target_sentences[sentence_idx]
-                        # Also remove the corresponding separator
-                        if sentence_idx < len(target_separators):
-                            del target_separators[sentence_idx]
-                        new_content = join_sentences(target_sentences, target_separators)
-                        write_doc(target_lang, new_content)
+                    target_chunks = read_doc(target_lang)
+                    target_contents = get_content_chunks(target_chunks)
 
-                        await broadcast_to_language(target_lang, {
-                            "type": "content",
-                            "language": target_lang,
-                            "content": new_content
-                        })
-                    else:
-                        logger.debug(f"Delete: sentence_idx {sentence_idx} out of range for {target_lang} ({len(target_sentences)} sentences)")
+                    # Get target context
+                    prev_target = target_contents[changed_idx-1][1]["text"] if changed_idx > 0 and changed_idx-1 < len(target_contents) else ""
+                    next_target = target_contents[changed_idx+1][1]["text"] if changed_idx+1 < len(target_contents) else ""
 
-            elif msg_type == "insert":
-                # Client inserted a new sentence
-                source_lang = data["language"]
-                update_activity(source_lang)
-                sentence_idx = data["sentence_index"]
-                new_sentence = data["new_sentence"]
-                full_content = data["full_content"]
-                logger.info(f"Insert operation: sentence {sentence_idx} in {source_lang}")
-                logger.debug(f"Insert: new_sentence='{new_sentence[:50]}...', full_content length={len(full_content)}")
+                    if change_type == 'delete':
+                        # Remove the content block at changed_idx
+                        if changed_idx < len(target_contents):
+                            chunk_idx = target_contents[changed_idx][0]
+                            # Remove content and following separator if exists
+                            if chunk_idx < len(target_chunks):
+                                del target_chunks[chunk_idx]
+                                # Also remove following separator
+                                if chunk_idx < len(target_chunks) and target_chunks[chunk_idx]["type"] == "separator":
+                                    del target_chunks[chunk_idx]
 
-                # Save snapshot before making changes
-                save_snapshot("insert")
-
-                # Save the source language
-                write_doc(source_lang, full_content)
-
-                # Broadcast the updated content to all clients viewing the source language
-                await broadcast_to_language(source_lang, {
-                    "type": "content",
-                    "language": source_lang,
-                    "content": full_content
-                }, exclude=ws)
-
-                # Broadcast pending translation with original text to other languages
-                for target_lang in LANGUAGES:
-                    if target_lang != source_lang:
-                        logger.debug(f"Insert: sending pending_translation to {target_lang} for sentence_idx={sentence_idx}")
-                        await broadcast_to_language(target_lang, {
-                            "type": "pending_translation",
-                            "sentence_index": sentence_idx,
-                            "original_text": new_sentence,
-                            "source_language": source_lang
-                        })
-
-                # Get context for translation
-                sentences = split_sentences(full_content)
-                before, _, after = get_context(sentences, sentence_idx)
-                logger.debug(f"Insert: context extracted - {len(before)} sentences before, {len(after)} sentences after")
-
-                # Translate and insert in other languages
-                try:
-                    for target_lang in LANGUAGES:
-                        if target_lang == source_lang:
-                            continue
-
-                        target_sentences, target_separators = split_sentences_with_separators(read_doc(target_lang))
-                        logger.debug(f"Insert: {target_lang} has {len(target_sentences)} sentences before insert")
-
-                        # Translate the new sentence
-                        translated = translate_sentence(
-                            new_sentence, before, after, source_lang, target_lang
+                    elif change_type == 'insert':
+                        # Translate and insert
+                        translated = translate_block(
+                            changed_block, prev_block, next_block,
+                            prev_target, next_target,
+                            source_lang, target_lang
                         )
-                        logger.debug(f"Insert: translated to {target_lang}: '{translated[:50]}...'")
-
-                        # Insert at the correct position
-                        target_sentences.insert(sentence_idx, translated)
-                        # Insert a default separator (single space) for the new sentence
-                        if sentence_idx < len(target_separators):
-                            target_separators.insert(sentence_idx, ' ')
+                        # Find where to insert in target chunks
+                        if changed_idx == 0:
+                            insert_pos = 0
+                        elif changed_idx < len(target_contents):
+                            insert_pos = target_contents[changed_idx][0]
                         else:
-                            target_separators.append(' ')
-                        logger.debug(f"Insert: {target_lang} now has {len(target_sentences)} sentences after insert")
+                            insert_pos = len(target_chunks)
 
-                        new_content = join_sentences(target_sentences, target_separators)
-                        write_doc(target_lang, new_content)
+                        # Insert content and separator
+                        target_chunks.insert(insert_pos, {"type": "content", "text": translated})
+                        # Copy separator from source if available
+                        source_sep_idx = new_contents[changed_idx][0] + 1
+                        if source_sep_idx < len(new_chunks) and new_chunks[source_sep_idx]["type"] == "separator":
+                            target_chunks.insert(insert_pos + 1, {"type": "separator", "text": new_chunks[source_sep_idx]["text"]})
 
-                        await broadcast_to_language(target_lang, {
-                            "type": "content",
-                            "language": target_lang,
-                            "content": new_content
-                        })
-
-                    await broadcast({"type": "translation_complete", "sentence_index": sentence_idx})
-                except TranslationError as e:
-                    await broadcast({
-                        "type": "translation_error",
-                        "sentence_index": sentence_idx,
-                        "error": str(e)
-                    })
-
-            elif msg_type == "edit":
-                # Client made an edit
-                source_lang = data["language"]
-                update_activity(source_lang)
-                sentence_idx = data["sentence_index"]
-                new_sentence = data["new_sentence"]
-                full_content = data["full_content"]
-                logger.info(f"Edit operation: sentence {sentence_idx} in {source_lang}")
-                logger.debug(f"Edit: new_sentence='{new_sentence[:50]}...', full_content length={len(full_content)}")
-
-                # Save snapshot before making changes
-                save_snapshot("edit")
-
-                # Save the source language immediately
-                write_doc(source_lang, full_content)
-
-                # Broadcast the updated content to all clients viewing the source language
-                await broadcast_to_language(source_lang, {
-                    "type": "content",
-                    "language": source_lang,
-                    "content": full_content
-                }, exclude=ws)
-
-                # Broadcast pending translation with original text to other languages
-                for target_lang in LANGUAGES:
-                    if target_lang != source_lang:
-                        logger.debug(f"Edit: sending pending_translation to {target_lang} for sentence_idx={sentence_idx}")
-                        await broadcast_to_language(target_lang, {
-                            "type": "pending_translation",
-                            "sentence_index": sentence_idx,
-                            "original_text": new_sentence,
-                            "source_language": source_lang
-                        })
-
-                # Get context for translation
-                sentences = split_sentences(full_content)
-                before, _, after = get_context(sentences, sentence_idx)
-                logger.debug(f"Edit: context extracted - {len(before)} sentences before, {len(after)} sentences after")
-
-                # Translate to other languages
-                try:
-                    for target_lang in LANGUAGES:
-                        if target_lang == source_lang:
-                            continue
-
-                        # Read current target doc
-                        target_content = read_doc(target_lang)
-                        target_sentences, target_separators = split_sentences_with_separators(target_content)
-                        logger.debug(f"Edit: {target_lang} has {len(target_sentences)} sentences, editing idx {sentence_idx}")
-
-                        # Ensure we have enough sentences (pad if needed)
-                        original_len = len(target_sentences)
-                        while len(target_sentences) <= sentence_idx:
-                            target_sentences.append("")
-                            target_separators.append(' ')
-                        if len(target_sentences) > original_len:
-                            logger.debug(f"Edit: padded {target_lang} from {original_len} to {len(target_sentences)} sentences")
-
-                        # Translate the sentence
-                        old_sentence = target_sentences[sentence_idx]
-                        logger.debug(f"Edit: {target_lang} old sentence: '{old_sentence[:50]}...'")
-                        translated = translate_sentence(
-                            new_sentence, before, after, source_lang, target_lang
+                    else:  # edit
+                        # Translate and replace
+                        translated = translate_block(
+                            changed_block, prev_block, next_block,
+                            prev_target, next_target,
+                            source_lang, target_lang
                         )
-                        logger.debug(f"Edit: {target_lang} new sentence: '{translated[:50]}...'")
-                        target_sentences[sentence_idx] = translated
+                        if changed_idx < len(target_contents):
+                            chunk_idx = target_contents[changed_idx][0]
+                            target_chunks[chunk_idx]["text"] = translated
+                        else:
+                            # Need to add new content
+                            target_chunks.append({"type": "content", "text": translated})
 
-                        # Save and broadcast
-                        new_content = join_sentences(target_sentences, target_separators)
-                        write_doc(target_lang, new_content)
-
-                        await broadcast_to_language(target_lang, {
-                            "type": "content",
-                            "language": target_lang,
-                            "content": new_content
-                        })
-
-                    # Notify translation complete
-                    await broadcast({"type": "translation_complete", "sentence_index": sentence_idx})
-                except TranslationError as e:
-                    await broadcast({
-                        "type": "translation_error",
-                        "sentence_index": sentence_idx,
-                        "error": str(e)
+                    write_doc(target_lang, target_chunks)
+                    await broadcast_to_lang(target_lang, {
+                        "type": "doc", "lang": target_lang,
+                        "text": chunks_to_text(target_chunks)
                     })
 
-            elif msg_type == "undo":
-                # Revert to previous state
-                logger.info("Undo operation requested")
-                restored = undo_last()
-                if restored:
-                    logger.debug(f"Undo: restored {len(restored)} language documents")
-                    # Broadcast updated content to all clients
-                    for lang, content in restored.items():
-                        logger.debug(f"Undo: broadcasting restored content for {lang}, length={len(content)}")
-                        await broadcast_to_language(lang, {
-                            "type": "content",
-                            "language": lang,
-                            "content": content
-                        })
-                    # Also send to the requesting client
-                    client_lang = clients.get(ws, "en")
-                    logger.debug(f"Undo: sending content to requesting client (lang={client_lang})")
-                    await ws.send_json({
-                        "type": "content",
-                        "language": client_lang,
-                        "content": restored.get(client_lang, "")
-                    })
-                else:
-                    logger.debug("Undo: no history to restore")
+                # Done syncing
+                await broadcast({"type": "syncing", "active": False})
 
     except WebSocketDisconnect:
         clients.pop(ws, None)
-        logger.info(f"WebSocket connection closed. Total clients: {len(clients)}")
-        await broadcast_connection_stats()
+        logger.info(f"Client disconnected. Total: {len(clients)}")
+        await broadcast({"type": "clients", "count": len(clients)})
 
 # --- Static Files ---
 
@@ -732,5 +339,5 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting Babbel Docs server on 0.0.0.0:8000")
+    logger.info("Starting server on 0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
