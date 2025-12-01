@@ -124,18 +124,25 @@
             return blocks;
         };
 
-        // Placeholder for untranslated blocks (must match backend)
+        // Markers for untranslated blocks (must match backend)
         const PLACEHOLDER = '…';
+        const FALLBACK_MARKER = '⟨';
 
         // Update highlight layer to show translating blocks
         const updateHighlights = () => {
-            const blocks = splitIntoBlocks(editor.value);
+            // Use original text with markers for detecting fallback blocks
+            const textWithMarkers = editor.dataset.originalText || editor.value;
+            const blocks = splitIntoBlocks(textWithMarkers);
             let contentIdx = 0;
             let html = '';
             let hasHighlights = false;
 
             for (const block of blocks) {
-                const escaped = block.text
+                // Check if this is fallback text (source language shown while translating)
+                const isFallback = block.text.startsWith(FALLBACK_MARKER);
+                const displayText = isFallback ? block.text.slice(1) : block.text;
+
+                const escaped = displayText
                     .replace(/&/g, '&amp;')
                     .replace(/</g, '&lt;')
                     .replace(/>/g, '&gt;')
@@ -143,7 +150,7 @@
 
                 if (block.type === 'content') {
                     const isPlaceholder = block.text === PLACEHOLDER;
-                    const shouldHighlight = translatingBlocks.includes(contentIdx) || isPlaceholder;
+                    const shouldHighlight = translatingBlocks.includes(contentIdx) || isPlaceholder || isFallback;
 
                     if (shouldHighlight) {
                         hasHighlights = true;
@@ -182,8 +189,12 @@
                 if (msg.type === 'doc') {
                     clearTimeout(debounceTimer);
                     receivingUpdate = true;
-                    editor.value = msg.text;
-                    lastSentText = msg.text;
+                    // Strip markers for display but keep original for highlight detection
+                    const displayText = msg.text.replace(new RegExp(FALLBACK_MARKER, 'g'), '');
+                    editor.value = displayText;
+                    lastSentText = displayText;
+                    // Store original text with markers for highlighting
+                    editor.dataset.originalText = msg.text;
                     receivingUpdate = false;
                     updateHighlights();
                 }
@@ -214,6 +225,9 @@
         // Send update when user stops typing
         editor.addEventListener('input', () => {
             if (receivingUpdate) return;
+
+            // Clear stored original text since user is now editing
+            delete editor.dataset.originalText;
 
             clearTimeout(debounceTimer);
             const text = editor.value.replace(new RegExp(PLACEHOLDER, 'g'), '');

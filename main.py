@@ -32,7 +32,8 @@ DOCS_DIR.mkdir(exist_ok=True)
 SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f'
 LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
 TRANSLATION_DELAY = 2.0  # seconds to wait before starting translation
-PLACEHOLDER = '…'  # Used for untranslated blocks
+PLACEHOLDER = '…'  # Used for completely empty blocks
+FALLBACK_MARKER = '⟨'  # Prefix for fallback text (source language shown while translating)
 
 clients: dict[WebSocket, str] = {}
 DOC_PATH = DOCS_DIR / "document.json"
@@ -53,13 +54,20 @@ def save_doc(doc: list):
     DOC_PATH.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
 
 def doc_to_text(doc: list, lang: str) -> str:
-    """Convert doc to text for a specific language. Use placeholder for missing translations."""
+    """Convert doc to text for a specific language. Show source text for missing translations."""
     parts = []
     for item in doc:
         if isinstance(item, dict):
             text = item.get(lang, "")
-            # Use placeholder for missing translations to preserve block structure
-            parts.append(text if text else PLACEHOLDER)
+            if not text:
+                # Show source language text with marker (will be highlighted)
+                for fallback_lang in LANGUAGES:
+                    if fallback_lang in item and item[fallback_lang]:
+                        text = FALLBACK_MARKER + item[fallback_lang]
+                        break
+                if not text:
+                    text = PLACEHOLDER
+            parts.append(text)
         else:
             parts.append(item)
     return "".join(parts)
@@ -69,8 +77,8 @@ def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
     if not text:
         return []
 
-    # Remove placeholders from incoming text
-    text = text.replace(PLACEHOLDER, '')
+    # Remove placeholders and fallback markers from incoming text
+    text = text.replace(PLACEHOLDER, '').replace(FALLBACK_MARKER, '')
 
     pattern = f'([{re.escape(SENTENCE_ENDERS)}]+\\s*|\\n+)'
     parts = [p for p in re.split(pattern, text) if p]
