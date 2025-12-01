@@ -16,22 +16,38 @@
             align-items: center; margin-bottom: 1rem;
         }
         h1 { font-size: 1.5rem; color: #333; }
-        select, button {
+        select {
             padding: 0.5rem 1rem; font-size: 1rem;
             border: 1px solid #ccc; border-radius: 4px;
             margin-left: 0.5rem;
         }
-        button { background: #007bff; color: white; border: none; cursor: pointer; }
-        button:hover { background: #0056b3; }
+
+        .editor-wrap { position: relative; }
+
+        #highlight-layer {
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+            padding: 1rem; pointer-events: none;
+            font-size: 1rem; line-height: 1.6;
+            font-family: system-ui, sans-serif;
+            white-space: pre-wrap; word-wrap: break-word;
+            border: 2px solid transparent; border-radius: 8px;
+            overflow: hidden;
+        }
 
         #editor {
             width: 100%; min-height: 400px; padding: 1rem;
             font-size: 1rem; line-height: 1.6;
             border: 2px solid #ddd; border-radius: 8px;
-            background: white; resize: vertical;
-            font-family: inherit;
+            background: transparent; resize: vertical;
+            font-family: system-ui, sans-serif;
+            position: relative;
         }
         #editor:focus { outline: none; border-color: #007bff; }
+
+        .highlight-block {
+            background: #ffeb3b;
+            border-radius: 2px;
+        }
 
         #status {
             margin-top: 0.5rem; padding: 0.5rem;
@@ -40,23 +56,15 @@
         .connected { color: #28a745; }
         .disconnected { color: #dc3545; }
 
-        /* Syncing indicator - always visible when active */
-        #syncing {
+        #translating-status {
             position: fixed; top: 1rem; right: 1rem;
             padding: 0.75rem 1.5rem; border-radius: 4px;
             background: #ff6b00; color: white;
-            font-weight: bold; font-size: 1rem;
-            display: none; z-index: 9999;
+            font-weight: bold; display: none;
             animation: pulse 1s ease-in-out infinite;
         }
-        #syncing.active { display: block; }
+        #translating-status.active { display: block; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-
-        /* Pending translation highlight */
-        .pending {
-            background: #ffcccc; color: #cc0000;
-            padding: 2px 4px; border-radius: 2px;
-        }
     </style>
 </head>
 <body>
@@ -72,23 +80,80 @@
         </div>
     </header>
 
-    <textarea id="editor" placeholder="Start typing..."></textarea>
+    <div class="editor-wrap">
+        <div id="highlight-layer"></div>
+        <textarea id="editor" placeholder="Start typing..."></textarea>
+    </div>
 
     <div id="status" class="disconnected">Disconnected</div>
-    <div id="syncing">Syncing...</div>
+    <div id="translating-status">Translating...</div>
 
     <script>
         const editor = document.getElementById('editor');
+        const highlightLayer = document.getElementById('highlight-layer');
         const langSelect = document.getElementById('language');
         const statusEl = document.getElementById('status');
         const clientsEl = document.getElementById('clients');
-        const syncingEl = document.getElementById('syncing');
+        const translatingStatus = document.getElementById('translating-status');
 
         let ws = null;
         let currentLang = 'en';
         let debounceTimer = null;
         let lastSentText = '';
-        let receivingUpdate = false;  // Flag to prevent re-sending server pushes
+        let receivingUpdate = false;
+        let translatingBlocks = [];  // Block indices being translated
+
+        // Sentence enders (must match backend)
+        const SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f';
+
+        // Split text into blocks (content and separators)
+        const splitIntoBlocks = (text) => {
+            if (!text) return [];
+            const pattern = new RegExp(`([${SENTENCE_ENDERS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}]+\\s*|\\n+)`);
+            const parts = text.split(pattern).filter(p => p);
+
+            const blocks = [];
+            for (const part of parts) {
+                const isSep = new RegExp(`^[${SENTENCE_ENDERS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s\\n]+$`).test(part);
+                blocks.push({ type: isSep ? 'sep' : 'content', text: part });
+            }
+            return blocks;
+        };
+
+        // Update highlight layer to show translating blocks
+        const updateHighlights = () => {
+            if (translatingBlocks.length === 0) {
+                highlightLayer.innerHTML = '';
+                highlightLayer.style.background = 'white';
+                return;
+            }
+
+            const blocks = splitIntoBlocks(editor.value);
+            let contentIdx = 0;
+            let html = '';
+
+            for (const block of blocks) {
+                const escaped = block.text
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/\n/g, '<br>');
+
+                if (block.type === 'content') {
+                    if (translatingBlocks.includes(contentIdx)) {
+                        html += `<span class="highlight-block">${escaped}</span>`;
+                    } else {
+                        html += escaped;
+                    }
+                    contentIdx++;
+                } else {
+                    html += escaped;
+                }
+            }
+
+            highlightLayer.innerHTML = html;
+            highlightLayer.style.background = 'white';
+        };
 
         const connect = () => {
             ws = new WebSocket(`ws://${location.host}/ws`);
@@ -107,42 +172,42 @@
 
             ws.onmessage = (e) => {
                 const msg = JSON.parse(e.data);
-                console.log('Received:', msg);
+                console.log('Received:', msg.type);
 
                 if (msg.type === 'doc') {
-                    // Prevent this update from triggering a re-send
                     clearTimeout(debounceTimer);
                     receivingUpdate = true;
                     editor.value = msg.text;
                     lastSentText = msg.text;
                     receivingUpdate = false;
+                    updateHighlights();
                 }
 
                 if (msg.type === 'clients') {
                     clientsEl.textContent = `${msg.count} user${msg.count !== 1 ? 's' : ''}`;
                 }
 
-                if (msg.type === 'syncing') {
-                    if (msg.active) {
-                        syncingEl.classList.add('active');
+                if (msg.type === 'translating') {
+                    translatingBlocks = msg.blocks || [];
+                    if (translatingBlocks.length > 0) {
+                        translatingStatus.classList.add('active');
                     } else {
-                        syncingEl.classList.remove('active');
-                        pendingBlocks = {};
+                        translatingStatus.classList.remove('active');
                     }
+                    updateHighlights();
                 }
-
             };
         };
 
         // Send update when user stops typing
         editor.addEventListener('input', () => {
-            if (receivingUpdate) return;  // Don't send if we're receiving a server push
+            if (receivingUpdate) return;
 
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => {
                 const text = editor.value;
                 if (text !== lastSentText && ws?.readyState === WebSocket.OPEN) {
-                    console.log('Sending update:', text.length, 'chars');
+                    console.log('Sending update');
                     ws.send(JSON.stringify({
                         type: 'update',
                         lang: currentLang,
@@ -153,9 +218,16 @@
             }, 500);
         });
 
+        // Sync scroll
+        editor.addEventListener('scroll', () => {
+            highlightLayer.scrollTop = editor.scrollTop;
+        });
+
         // Language switching
         langSelect.addEventListener('change', () => {
             currentLang = langSelect.value;
+            translatingBlocks = [];
+            updateHighlights();
             if (ws?.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'load', lang: currentLang }));
             }

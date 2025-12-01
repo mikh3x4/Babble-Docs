@@ -212,19 +212,9 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Content changed - need to translate
                 logger.info(f"Changed blocks: {changed_indices}")
-                await broadcast({"type": "syncing", "active": True})
 
-                # Send pending (original text) to other languages
-                for idx in changed_indices:
-                    if idx < len(new_contents):
-                        original_text = new_contents[idx].get(source_lang, "")
-                        for target_lang in LANGUAGES:
-                            if target_lang != source_lang:
-                                new_contents[idx][target_lang] = f"[{original_text}]"
-
-                save_doc(new_doc)
-                # Send placeholders to other languages only (not back to sender)
-                await send_doc_to_all(new_doc, exclude=ws)
+                # Tell all clients which blocks are being translated
+                await broadcast({"type": "translating", "blocks": changed_indices}, exclude=ws)
 
                 # Now translate each changed block
                 for idx in changed_indices:
@@ -259,9 +249,10 @@ async def websocket_endpoint(ws: WebSocket):
                         new_contents[idx][target_lang] = translated
 
                 save_doc(new_doc)
-                # Don't send back to the client that made the edit
+                # Send translated doc to all other clients
                 await send_doc_to_all(new_doc, exclude=ws)
-                await broadcast({"type": "syncing", "active": False})
+                # Clear translating state
+                await broadcast({"type": "translating", "blocks": []}, exclude=ws)
 
     except WebSocketDisconnect:
         clients.pop(ws, None)
