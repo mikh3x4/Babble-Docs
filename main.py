@@ -13,11 +13,16 @@ from fastapi.responses import FileResponse
 import anthropic
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.FileHandler('babbel.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+
+# Quiet noisy loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
 load_dotenv()
 
 app = FastAPI()
@@ -272,4 +277,5 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting server on 0.0.0.0:8000")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True,
+                reload_excludes=["*.log", "docs/*"])
