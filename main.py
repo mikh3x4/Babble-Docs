@@ -57,9 +57,14 @@ def get_doc_path(lang: str) -> Path:
 
 def read_doc(lang: str) -> str:
     path = get_doc_path(lang)
-    return path.read_text() if path.exists() else ""
+    content = path.read_text() if path.exists() else ""
+    preview = content[:100] + "..." if len(content) > 100 else content
+    logger.debug(f"read_doc({lang}): {len(content)} chars, preview='{preview}'")
+    return content
 
 def write_doc(lang: str, content: str):
+    preview = content[:100] + "..." if len(content) > 100 else content
+    logger.debug(f"write_doc({lang}): {len(content)} chars, preview='{preview}'")
     get_doc_path(lang).write_text(content)
 
 # --- Edit History ---
@@ -104,10 +109,13 @@ def undo_last() -> dict | None:
 def split_sentences(text: str) -> list[str]:
     """Split text into sentences. Handles ., !, ? followed by space or end."""
     if not text.strip():
+        logger.debug(f"split_sentences: empty text, returning []")
         return []
     # Split on sentence-ending punctuation followed by space or end
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [p for p in parts if p]
+    result = [p for p in parts if p]
+    logger.debug(f"split_sentences: {len(result)} sentences from {len(text)} chars")
+    return result
 
 def join_sentences(sentences: list[str]) -> str:
     return " ".join(sentences)
@@ -117,6 +125,7 @@ def get_context(sentences: list[str], idx: int, window: int = 5) -> tuple[list[s
     before = sentences[max(0, idx - window):idx]
     target = sentences[idx] if idx < len(sentences) else ""
     after = sentences[idx + 1:idx + 1 + window]
+    logger.debug(f"get_context: idx={idx}, before={len(before)} sentences, target='{target[:50]}...', after={len(after)} sentences")
     return before, target, after
 
 # --- Translation ---
@@ -267,7 +276,9 @@ async def idle_check_loop():
             continue
 
         elapsed = time.time() - last_activity_time
+        logger.debug(f"idle_check_loop: elapsed={elapsed:.1f}s, threshold={IDLE_THRESHOLD_SECONDS}s, check_running={consistency_check_running}")
         if elapsed >= IDLE_THRESHOLD_SECONDS and not consistency_check_running:
+            logger.info(f"idle_check_loop: idle threshold reached ({elapsed:.1f}s), triggering consistency check")
             last_activity_time = 0  # Reset to prevent repeated checks
             await run_consistency_check()
 
@@ -276,11 +287,14 @@ def update_activity():
     global last_activity_time
     import time
     last_activity_time = time.time()
+    logger.debug(f"update_activity: timestamp set to {last_activity_time}")
 
 # --- WebSocket Broadcasting ---
 
 async def broadcast(message: dict, exclude: WebSocket = None):
     """Send message to all connected clients except excluded one."""
+    target_count = len([ws for ws in clients if ws != exclude])
+    logger.debug(f"broadcast: type={message.get('type')}, to {target_count} clients (excluding 1: {exclude is not None})")
     dead = []
     for ws in clients:
         if ws != exclude:
@@ -288,22 +302,28 @@ async def broadcast(message: dict, exclude: WebSocket = None):
                 await ws.send_json(message)
             except:
                 dead.append(ws)
+    if dead:
+        logger.debug(f"broadcast: removed {len(dead)} dead connections")
     for ws in dead:
         clients.pop(ws, None)
 
 async def broadcast_to_language(lang: str, message: dict, exclude: WebSocket = None):
     """Send message only to clients viewing a specific language."""
+    target_count = len([ws for ws, ws_lang in clients.items() if ws_lang == lang and ws != exclude])
+    logger.debug(f"broadcast_to_language({lang}): type={message.get('type')}, to {target_count} clients")
     for ws, ws_lang in list(clients.items()):
         if ws_lang == lang and ws != exclude:
             try:
                 await ws.send_json(message)
             except:
+                logger.debug(f"broadcast_to_language({lang}): removed dead connection")
                 clients.pop(ws, None)
 
 async def broadcast_connection_stats():
     """Broadcast current connection stats to all clients."""
     from collections import Counter
     lang_counts = Counter(clients.values())
+    logger.debug(f"broadcast_connection_stats: total={len(clients)}, by_language={dict(lang_counts)}")
     await broadcast({
         "type": "connection_stats",
         "total": len(clients),
@@ -323,6 +343,7 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             data = json.loads(await ws.receive_text())
             msg_type = data.get("type")
+            logger.debug(f"Received message: type={msg_type}, data keys={list(data.keys())}")
 
             if msg_type == "load":
                 # Client wants to load a language version
@@ -340,6 +361,7 @@ async def websocket_endpoint(ws: WebSocket):
                 sentence_idx = data["sentence_index"]
                 full_content = data["full_content"]
                 logger.info(f"Delete operation: sentence {sentence_idx} in {source_lang}")
+                logger.debug(f"Delete: full_content length={len(full_content)}")
 
                 # Save snapshot before making changes
                 save_snapshot("delete")
@@ -353,7 +375,10 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
 
                     target_sentences = split_sentences(read_doc(target_lang))
+                    logger.debug(f"Delete: {target_lang} has {len(target_sentences)} sentences, deleting idx {sentence_idx}")
                     if sentence_idx < len(target_sentences):
+                        deleted_sentence = target_sentences[sentence_idx]
+                        logger.debug(f"Delete: removing sentence '{deleted_sentence[:50]}...' from {target_lang}")
                         del target_sentences[sentence_idx]
                         new_content = join_sentences(target_sentences)
                         write_doc(target_lang, new_content)
@@ -363,6 +388,8 @@ async def websocket_endpoint(ws: WebSocket):
                             "language": target_lang,
                             "content": new_content
                         })
+                    else:
+                        logger.debug(f"Delete: sentence_idx {sentence_idx} out of range for {target_lang} ({len(target_sentences)} sentences)")
 
             elif msg_type == "insert":
                 # Client inserted a new sentence
@@ -372,6 +399,7 @@ async def websocket_endpoint(ws: WebSocket):
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
                 logger.info(f"Insert operation: sentence {sentence_idx} in {source_lang}")
+                logger.debug(f"Insert: new_sentence='{new_sentence[:50]}...', full_content length={len(full_content)}")
 
                 # Save snapshot before making changes
                 save_snapshot("insert")
@@ -382,6 +410,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # Broadcast pending translation with original text to other languages
                 for target_lang in LANGUAGES:
                     if target_lang != source_lang:
+                        logger.debug(f"Insert: sending pending_translation to {target_lang} for sentence_idx={sentence_idx}")
                         await broadcast_to_language(target_lang, {
                             "type": "pending_translation",
                             "sentence_index": sentence_idx,
@@ -392,6 +421,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # Get context for translation
                 sentences = split_sentences(full_content)
                 before, _, after = get_context(sentences, sentence_idx)
+                logger.debug(f"Insert: context extracted - {len(before)} sentences before, {len(after)} sentences after")
 
                 # Translate and insert in other languages
                 try:
@@ -400,14 +430,17 @@ async def websocket_endpoint(ws: WebSocket):
                             continue
 
                         target_sentences = split_sentences(read_doc(target_lang))
+                        logger.debug(f"Insert: {target_lang} has {len(target_sentences)} sentences before insert")
 
                         # Translate the new sentence
                         translated = translate_sentence(
                             new_sentence, before, after, source_lang, target_lang
                         )
+                        logger.debug(f"Insert: translated to {target_lang}: '{translated[:50]}...'")
 
                         # Insert at the correct position
                         target_sentences.insert(sentence_idx, translated)
+                        logger.debug(f"Insert: {target_lang} now has {len(target_sentences)} sentences after insert")
 
                         new_content = join_sentences(target_sentences)
                         write_doc(target_lang, new_content)
@@ -434,6 +467,7 @@ async def websocket_endpoint(ws: WebSocket):
                 new_sentence = data["new_sentence"]
                 full_content = data["full_content"]
                 logger.info(f"Edit operation: sentence {sentence_idx} in {source_lang}")
+                logger.debug(f"Edit: new_sentence='{new_sentence[:50]}...', full_content length={len(full_content)}")
 
                 # Save snapshot before making changes
                 save_snapshot("edit")
@@ -444,6 +478,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # Broadcast pending translation with original text to other languages
                 for target_lang in LANGUAGES:
                     if target_lang != source_lang:
+                        logger.debug(f"Edit: sending pending_translation to {target_lang} for sentence_idx={sentence_idx}")
                         await broadcast_to_language(target_lang, {
                             "type": "pending_translation",
                             "sentence_index": sentence_idx,
@@ -454,6 +489,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # Get context for translation
                 sentences = split_sentences(full_content)
                 before, _, after = get_context(sentences, sentence_idx)
+                logger.debug(f"Edit: context extracted - {len(before)} sentences before, {len(after)} sentences after")
 
                 # Translate to other languages
                 try:
@@ -464,15 +500,22 @@ async def websocket_endpoint(ws: WebSocket):
                         # Read current target doc
                         target_content = read_doc(target_lang)
                         target_sentences = split_sentences(target_content)
+                        logger.debug(f"Edit: {target_lang} has {len(target_sentences)} sentences, editing idx {sentence_idx}")
 
                         # Ensure we have enough sentences (pad if needed)
+                        original_len = len(target_sentences)
                         while len(target_sentences) <= sentence_idx:
                             target_sentences.append("")
+                        if len(target_sentences) > original_len:
+                            logger.debug(f"Edit: padded {target_lang} from {original_len} to {len(target_sentences)} sentences")
 
                         # Translate the sentence
+                        old_sentence = target_sentences[sentence_idx]
+                        logger.debug(f"Edit: {target_lang} old sentence: '{old_sentence[:50]}...'")
                         translated = translate_sentence(
                             new_sentence, before, after, source_lang, target_lang
                         )
+                        logger.debug(f"Edit: {target_lang} new sentence: '{translated[:50]}...'")
                         target_sentences[sentence_idx] = translated
 
                         # Save and broadcast
@@ -499,8 +542,10 @@ async def websocket_endpoint(ws: WebSocket):
                 logger.info("Undo operation requested")
                 restored = undo_last()
                 if restored:
+                    logger.debug(f"Undo: restored {len(restored)} language documents")
                     # Broadcast updated content to all clients
                     for lang, content in restored.items():
+                        logger.debug(f"Undo: broadcasting restored content for {lang}, length={len(content)}")
                         await broadcast_to_language(lang, {
                             "type": "content",
                             "language": lang,
@@ -508,11 +553,14 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                     # Also send to the requesting client
                     client_lang = clients.get(ws, "en")
+                    logger.debug(f"Undo: sending content to requesting client (lang={client_lang})")
                     await ws.send_json({
                         "type": "content",
                         "language": client_lang,
                         "content": restored.get(client_lang, "")
                     })
+                else:
+                    logger.debug("Undo: no history to restore")
 
     except WebSocketDisconnect:
         clients.pop(ws, None)
