@@ -119,6 +119,32 @@ async def websocket_endpoint(ws: WebSocket):
                 clients[ws] = lang
                 await ws.send_json({"type": "content", "language": lang, "content": read_doc(lang)})
 
+            elif msg_type == "delete":
+                # Client deleted a sentence
+                source_lang = data["language"]
+                sentence_idx = data["sentence_index"]
+                full_content = data["full_content"]
+
+                # Save the source language
+                write_doc(source_lang, full_content)
+
+                # Delete the same sentence from all other languages
+                for target_lang in LANGUAGES:
+                    if target_lang == source_lang:
+                        continue
+
+                    target_sentences = split_sentences(read_doc(target_lang))
+                    if sentence_idx < len(target_sentences):
+                        del target_sentences[sentence_idx]
+                        new_content = join_sentences(target_sentences)
+                        write_doc(target_lang, new_content)
+
+                        await broadcast_to_language(target_lang, {
+                            "type": "content",
+                            "language": target_lang,
+                            "content": new_content
+                        })
+
             elif msg_type == "edit":
                 # Client made an edit
                 source_lang = data["language"]
