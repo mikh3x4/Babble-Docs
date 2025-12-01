@@ -223,6 +223,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 new_contents[idx][target_lang] = f"[{original_text}]"
 
                 save_doc(new_doc)
+                # Send placeholders to other languages only (not back to sender)
                 await send_doc_to_all(new_doc, exclude=ws)
 
                 # Now translate each changed block
@@ -258,7 +259,8 @@ async def websocket_endpoint(ws: WebSocket):
                         new_contents[idx][target_lang] = translated
 
                 save_doc(new_doc)
-                await send_doc_to_all(new_doc)
+                # Don't send back to the client that made the edit
+                await send_doc_to_all(new_doc, exclude=ws)
                 await broadcast({"type": "syncing", "active": False})
 
     except WebSocketDisconnect:
