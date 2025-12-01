@@ -272,6 +272,7 @@ async def run_consistency_check():
         logger.info(f"Sentence count mismatch detected: {sentence_counts}")
 
         # Notify clients that sync is starting
+        logger.info("Broadcasting consistency_check status: started")
         await broadcast({"type": "consistency_check", "status": "started"})
 
         # Use Claude to reconcile
@@ -299,7 +300,7 @@ Return your response in this exact JSON format (no other text):
 }}"""
 
         response = client.messages.create(
-            model="claude-opus-4-20250514",
+            model="claude-sonnet-4-20250514",
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -328,11 +329,13 @@ Return your response in this exact JSON format (no other text):
                     "content": content
                 })
 
+        logger.info("Broadcasting consistency_check status: completed")
         await broadcast({"type": "consistency_check", "status": "completed"})
         logger.info("Consistency check completed successfully")
 
     except Exception as e:
         logger.error(f"Consistency check failed: {e}")
+        logger.info("Broadcasting consistency_check status: error")
         await broadcast({"type": "consistency_check", "status": "error", "error": str(e)})
     finally:
         consistency_check_running = False
