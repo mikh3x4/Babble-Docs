@@ -145,6 +145,53 @@ async def websocket_endpoint(ws: WebSocket):
                             "content": new_content
                         })
 
+            elif msg_type == "insert":
+                # Client inserted a new sentence
+                source_lang = data["language"]
+                sentence_idx = data["sentence_index"]
+                new_sentence = data["new_sentence"]
+                full_content = data["full_content"]
+
+                # Save the source language
+                write_doc(source_lang, full_content)
+
+                # Notify translation in progress
+                await broadcast({
+                    "type": "translating",
+                    "sentence_index": sentence_idx,
+                    "source_language": source_lang
+                }, exclude=ws)
+
+                # Get context for translation
+                sentences = split_sentences(full_content)
+                before, _, after = get_context(sentences, sentence_idx)
+
+                # Translate and insert in other languages
+                for target_lang in LANGUAGES:
+                    if target_lang == source_lang:
+                        continue
+
+                    target_sentences = split_sentences(read_doc(target_lang))
+
+                    # Translate the new sentence
+                    translated = translate_sentence(
+                        new_sentence, before, after, source_lang, target_lang
+                    )
+
+                    # Insert at the correct position
+                    target_sentences.insert(sentence_idx, translated)
+
+                    new_content = join_sentences(target_sentences)
+                    write_doc(target_lang, new_content)
+
+                    await broadcast_to_language(target_lang, {
+                        "type": "content",
+                        "language": target_lang,
+                        "content": new_content
+                    })
+
+                await broadcast({"type": "translation_complete", "sentence_index": sentence_idx})
+
             elif msg_type == "edit":
                 # Client made an edit
                 source_lang = data["language"]

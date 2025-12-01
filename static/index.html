@@ -92,21 +92,28 @@
 
             // Detect deletion: fewer sentences than before
             if (newSentences.length < oldSentences.length) {
-                // Find which sentence was deleted
                 for (let i = 0; i < newSentences.length; i++) {
                     if (oldSentences[i] !== newSentences[i]) {
-                        return { index: i, deleted: true };
+                        return { type: 'delete', index: i };
                     }
                 }
-                // Last sentence was deleted
-                return { index: newSentences.length, deleted: true };
+                return { type: 'delete', index: newSentences.length };
             }
 
-            // Find first differing sentence
-            const maxLen = Math.max(oldSentences.length, newSentences.length);
-            for (let i = 0; i < maxLen; i++) {
+            // Detect insertion: more sentences than before
+            if (newSentences.length > oldSentences.length) {
+                for (let i = 0; i < newSentences.length; i++) {
+                    if (oldSentences[i] !== newSentences[i]) {
+                        return { type: 'insert', index: i, sentence: newSentences[i] };
+                    }
+                }
+                return { type: 'insert', index: newSentences.length - 1, sentence: newSentences[newSentences.length - 1] };
+            }
+
+            // Same count: find edited sentence
+            for (let i = 0; i < newSentences.length; i++) {
                 if (oldSentences[i] !== newSentences[i]) {
-                    return { index: i, sentence: newSentences[i] || '' };
+                    return { type: 'edit', index: i, sentence: newSentences[i] };
                 }
             }
             return null;
@@ -167,22 +174,13 @@
             editTimeout = setTimeout(() => {
                 const change = findChangedSentence(previousContent, editor.value);
                 if (change && ws?.readyState === WebSocket.OPEN) {
-                    if (change.deleted) {
-                        ws.send(JSON.stringify({
-                            type: 'delete',
-                            language: currentLang,
-                            sentence_index: change.index,
-                            full_content: editor.value
-                        }));
-                    } else {
-                        ws.send(JSON.stringify({
-                            type: 'edit',
-                            language: currentLang,
-                            sentence_index: change.index,
-                            new_sentence: change.sentence,
-                            full_content: editor.value
-                        }));
-                    }
+                    ws.send(JSON.stringify({
+                        type: change.type,
+                        language: currentLang,
+                        sentence_index: change.index,
+                        new_sentence: change.sentence,
+                        full_content: editor.value
+                    }));
                     previousContent = editor.value;
                 }
             }, 500);
