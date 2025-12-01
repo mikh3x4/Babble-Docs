@@ -17,13 +17,31 @@
             padding: 0.5rem 1rem; font-size: 1rem;
             border: 1px solid #ccc; border-radius: 4px;
         }
+        .editor-container {
+            position: relative;
+            width: 100%;
+        }
+        #editor-highlight {
+            position: absolute; top: 0; left: 0; right: 0;
+            min-height: 400px; padding: 1rem;
+            font-size: 1rem; line-height: 1.6;
+            border: 2px solid transparent; border-radius: 8px;
+            background: white; white-space: pre-wrap; word-wrap: break-word;
+            pointer-events: none; overflow: hidden;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
         #editor {
+            position: relative;
             width: 100%; min-height: 400px; padding: 1rem;
             font-size: 1rem; line-height: 1.6;
             border: 2px solid #ddd; border-radius: 8px;
-            background: white; resize: vertical;
+            background: transparent; resize: vertical;
+            font-family: system-ui, -apple-system, sans-serif;
         }
         #editor:focus { outline: none; border-color: #007bff; }
+        .sentence-highlight {
+            background: #ffeb3b; border-radius: 2px;
+        }
         #status {
             margin-top: 0.5rem; padding: 0.5rem;
             font-size: 0.875rem; color: #666;
@@ -62,7 +80,10 @@
         </select>
     </header>
 
-    <textarea id="editor" placeholder="Start typing..."></textarea>
+    <div class="editor-container">
+        <div id="editor-highlight"></div>
+        <textarea id="editor" placeholder="Start typing..."></textarea>
+    </div>
 
     <div id="sentence-status">
         <span class="spinner"></span>
@@ -74,6 +95,7 @@
 
     <script>
         const editor = document.getElementById('editor');
+        const editorHighlight = document.getElementById('editor-highlight');
         const langSelect = document.getElementById('language');
         const statusEl = document.getElementById('status');
         const sentenceStatus = document.getElementById('sentence-status');
@@ -89,6 +111,23 @@
         const splitSentences = (text) => {
             if (!text.trim()) return [];
             return text.trim().split(/(?<=[.!?])\s+/).filter(s => s);
+        };
+
+        // Render highlight overlay with highlighted sentences
+        const updateHighlightOverlay = () => {
+            const text = editor.value;
+            if (!text.trim() || translatingIndices.size === 0) {
+                editorHighlight.innerHTML = '';
+                return;
+            }
+            const sentences = splitSentences(text);
+            const html = sentences.map((s, i) => {
+                const escaped = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                return translatingIndices.has(i)
+                    ? `<span class="sentence-highlight">${escaped}</span>`
+                    : escaped;
+            }).join(' ');
+            editorHighlight.innerHTML = html;
         };
 
         // Find which sentence changed between old and new text
@@ -148,6 +187,7 @@
                     if (document.activeElement !== editor) {
                         editor.value = msg.content;
                         previousContent = msg.content;
+                        updateHighlightOverlay();
                     }
                 }
 
@@ -178,11 +218,13 @@
             } else {
                 sentenceStatus.classList.remove('active');
             }
+            updateHighlightOverlay();
         };
 
         // Send edit when user stops typing (debounced)
         let editTimeout = null;
         editor.addEventListener('input', () => {
+            updateHighlightOverlay();
             clearTimeout(editTimeout);
             editTimeout = setTimeout(() => {
                 const change = findChangedSentence(previousContent, editor.value);
@@ -197,6 +239,11 @@
                     previousContent = editor.value;
                 }
             }, 500);
+        });
+
+        // Sync scroll between editor and highlight overlay
+        editor.addEventListener('scroll', () => {
+            editorHighlight.scrollTop = editor.scrollTop;
         });
 
         // Language switching
