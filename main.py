@@ -61,31 +61,31 @@ def doc_to_text(doc: list, lang: str) -> str:
     return "".join(parts)
 
 def text_to_doc(text: str, lang: str, existing_doc: list = None) -> list:
+    """Parse text into doc structure, preserving translations by index."""
     if not text:
         return []
 
     pattern = f'([{re.escape(SENTENCE_ENDERS)}]+\\s*|\\n+)'
-    parts = re.split(pattern, text)
+    parts = [p for p in re.split(pattern, text) if p]
+
+    def is_sep(p):
+        return bool(re.match(f'^[{re.escape(SENTENCE_ENDERS)}\\s\\n]+$', p))
+
+    old_contents = [item for item in existing_doc if isinstance(item, dict)] if existing_doc else []
 
     new_doc = []
     content_idx = 0
 
     for part in parts:
-        if not part:
-            continue
-
-        is_sep = bool(re.match(f'^[{re.escape(SENTENCE_ENDERS)}\\s\\n]+$', part))
-
-        if is_sep:
+        if is_sep(part):
             new_doc.append(part)
         else:
             content_dict = {lang: part}
-            if existing_doc:
-                existing_contents = [item for item in existing_doc if isinstance(item, dict)]
-                if content_idx < len(existing_contents):
-                    for other_lang in LANGUAGES:
-                        if other_lang != lang and other_lang in existing_contents[content_idx]:
-                            content_dict[other_lang] = existing_contents[content_idx][other_lang]
+            # Copy translations from same index
+            if content_idx < len(old_contents):
+                for other_lang in LANGUAGES:
+                    if other_lang != lang and other_lang in old_contents[content_idx]:
+                        content_dict[other_lang] = old_contents[content_idx][other_lang]
             new_doc.append(content_dict)
             content_idx += 1
 
@@ -96,38 +96,52 @@ def get_content_blocks(doc: list) -> list[dict]:
 
 # --- Translation ---
 
-def translate_block(block: str, prev_block: str, next_block: str,
-                    prev_target: str, next_target: str,
+def remove_sentence_enders(text: str) -> str:
+    """Remove ALL sentence-ending punctuation from translation to preserve document structure."""
+    # Remove all sentence enders (ASCII + Unicode variants) and newlines
+    for char in SENTENCE_ENDERS + '。！？．｡\n\r':
+        text = text.replace(char, '')
+    return text.strip()
+
+def translate_block(block: str, context_before: str, context_after: str,
+                    target_context_before: str, target_context_after: str,
                     existing_translation: str,
                     source_lang: str, target_lang: str) -> str:
-    logger.info(f"Translating: {source_lang} -> {target_lang}")
+    """
+    Translate a single block. Context may include multiple preceding/following blocks
+    for short segments that need more context (like "e" from "e.g.").
+    """
+    logger.info(f"Translating: {source_lang} -> {target_lang}: '{block[:30]}'")
 
     client = anthropic.Anthropic()
 
     existing_hint = ""
     if existing_translation and not existing_translation.startswith("["):
-        existing_hint = f"\nPrevious translation (for consistency, may need updating): {existing_translation}"
+        existing_hint = f"\nPrevious translation (may need updating): {existing_translation}"
 
     prompt = f"""Translate from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}.
 
-Context (source language):
-Previous: {prev_block or '(start)'}
-TRANSLATE THIS: {block}
-Next: {next_block or '(end)'}
+Context before: {context_before or '(start of document)'}
+>>> TRANSLATE THIS: {block}
+Context after: {context_after or '(end of document)'}
 
 Target language context:
-Previous: {prev_target or '(start)'}
-Next: {next_target or '(end)'}
+Before: {target_context_before or '(start)'}
+After: {target_context_after or '(end)'}
 {existing_hint}
 
-Return ONLY the translated sentence. No quotes, no explanation."""
+IMPORTANT: Return ONLY the translation of "{block}". Do NOT include any punctuation like periods, exclamation marks, or question marks at the end - punctuation is handled separately. No quotes, no explanation."""
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
     )
-    return response.content[0].text.strip()
+    result = response.content[0].text.strip()
+    # Remove any sentence-ending punctuation the LLM might have added
+    result = remove_sentence_enders(result)
+    logger.info(f"Translation result: '{result[:50]}'")
+    return result
 
 # --- Broadcasting ---
 
@@ -199,62 +213,89 @@ async def do_translation(source_lang: str, changed_indices: list, exclude_ws: We
         doc = load_doc()
         contents = get_content_blocks(doc)
 
-        for idx in changed_indices:
-            if translation_cancelled:
-                logger.info("Translation cancelled mid-process")
-                break
+        def get_context(idx: int, lang: str, direction: int) -> str:
+            """
+            Get context in given direction (-1 for before, +1 for after).
+            If adjacent block is short (<10 chars), include one more block for context.
+            """
+            parts = []
+            i = idx + direction
+            while 0 <= i < len(contents) and len(parts) < 2:
+                text = contents[i].get(lang, "")
+                if direction < 0:
+                    parts.insert(0, text)
+                else:
+                    parts.append(text)
+                # If this block is short, get one more for context
+                if len(text) >= 10 or len(parts) >= 2:
+                    break
+                i += direction
+            return " ".join(parts) if parts else ""
 
+        # Build list of all translation tasks
+        async def translate_one(idx: int, target_lang: str):
+            """Translate a single block to a single language."""
             if idx >= len(contents):
-                continue
+                return None
 
             source_text = contents[idx].get(source_lang, "")
             if not source_text:
-                continue
+                return None
 
-            prev_source = contents[idx-1].get(source_lang, "") if idx > 0 else ""
-            next_source = contents[idx+1].get(source_lang, "") if idx < len(contents)-1 else ""
+            # Get extended context if adjacent blocks are short
+            context_before = get_context(idx, source_lang, -1)
+            context_after = get_context(idx, source_lang, +1)
+            target_before = get_context(idx, target_lang, -1)
+            target_after = get_context(idx, target_lang, +1)
+            existing = contents[idx].get(target_lang, "")
 
+            logger.info(f"Translating block {idx}: {source_lang}->{target_lang} (context: '{context_before[:20]}' | '{context_after[:20]}')")
+            translated = await asyncio.get_event_loop().run_in_executor(
+                None,
+                translate_block,
+                source_text, context_before, context_after,
+                target_before, target_after, existing,
+                source_lang, target_lang
+            )
+            return (idx, target_lang, translated)
+
+        # Create all translation tasks
+        tasks = []
+        for idx in changed_indices:
             for target_lang in LANGUAGES:
-                if target_lang == source_lang:
-                    continue
+                if target_lang != source_lang:
+                    tasks.append(translate_one(idx, target_lang))
 
-                if translation_cancelled:
-                    break
+        logger.info(f"Running {len(tasks)} translations in parallel")
 
-                existing = contents[idx].get(target_lang, "")
-                prev_target = contents[idx-1].get(target_lang, "") if idx > 0 else ""
-                next_target = contents[idx+1].get(target_lang, "") if idx < len(contents)-1 else ""
+        # Run all translations in parallel
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Run translation in thread pool to not block
-                logger.info(f"Translating block {idx}: {source_lang}->{target_lang}")
-                translated = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    translate_block,
-                    source_text, prev_source, next_source,
-                    prev_target, next_target, existing,
-                    source_lang, target_lang
-                )
+        if translation_cancelled:
+            logger.info("Translation cancelled, discarding results")
+        else:
+            # Apply results
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Translation error: {result}")
+                elif result:
+                    idx, target_lang, translated = result
+                    contents[idx][target_lang] = translated
 
-                if translation_cancelled:
-                    logger.info("Translation cancelled mid-block")
-                    break
-
-                logger.info(f"Block {idx} {target_lang}: '{source_text[:30]}...' -> '{translated[:30]}...'")
-                contents[idx][target_lang] = translated
-
-        if not translation_cancelled:
-            logger.info(f"Translation complete, saving and broadcasting")
+            logger.info(f"Translation complete, saving doc")
             save_doc(doc)
-            await send_doc_to_all(doc, exclude=exclude_ws)
 
-        # Clear translating state for other-language clients
-        for ws, ws_lang in list(clients.items()):
-            if ws_lang != source_lang:
-                try:
-                    await ws.send_json({"type": "translating", "blocks": []})
-                except:
-                    clients.pop(ws, None)
-        logger.info(f"Cleared translating state for non-{source_lang} clients")
+            # Clear translating state BEFORE sending doc update
+            for ws, ws_lang in list(clients.items()):
+                if ws_lang != source_lang:
+                    try:
+                        await ws.send_json({"type": "translating", "blocks": []})
+                    except:
+                        clients.pop(ws, None)
+            logger.info(f"Cleared translating state for non-{source_lang} clients")
+
+            # Now send the updated doc
+            await send_doc_to_all(doc, exclude=exclude_ws)
 
     except asyncio.CancelledError:
         logger.info("Translation task cancelled")
@@ -316,7 +357,7 @@ async def websocket_endpoint(ws: WebSocket):
                 new_contents = get_content_blocks(new_doc)
                 logger.info(f"Blocks: {len(old_contents)} -> {len(new_contents)}")
 
-                # Find what changed
+                # Find changed blocks by comparing content
                 changed_indices = []
                 for i in range(max(len(old_contents), len(new_contents))):
                     old_text = old_contents[i].get(source_lang, "") if i < len(old_contents) else ""
@@ -325,20 +366,12 @@ async def websocket_endpoint(ws: WebSocket):
                         changed_indices.append(i)
                         logger.info(f"Block {i} changed: '{old_text[:20]}' -> '{new_text_i[:20]}'")
 
-                # Save immediately
+                # Save and broadcast
                 save_doc(new_doc)
-
-                # Broadcast to same-language clients immediately
-                logger.info(f"Broadcasting to other {source_lang} clients")
-                await broadcast_to_lang(source_lang, {
-                    "type": "doc",
-                    "text": doc_to_text(new_doc, source_lang)
-                }, exclude=ws)
+                await send_doc_to_all(new_doc, exclude=ws)
 
                 if not changed_indices:
-                    # Only separators changed
-                    logger.info("Only separators changed, broadcasting to all")
-                    await send_doc_to_all(new_doc, exclude=ws)
+                    logger.info("No content changes")
                     continue
 
                 # Cancel any pending translation and start new one

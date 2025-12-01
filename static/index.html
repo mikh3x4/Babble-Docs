@@ -132,6 +132,7 @@
             }
 
             const blocks = splitIntoBlocks(editor.value);
+            console.log('Highlighting blocks:', translatingBlocks, 'Text blocks:', blocks.map((b, i) => ({i, type: b.type, text: b.text.slice(0, 20)})));
             let contentIdx = 0;
             let html = '';
 
@@ -143,7 +144,9 @@
                     .replace(/\n/g, '<br>');
 
                 if (block.type === 'content') {
-                    if (translatingBlocks.includes(contentIdx)) {
+                    const shouldHighlight = translatingBlocks.includes(contentIdx);
+                    if (shouldHighlight) {
+                        console.log(`Highlighting content block ${contentIdx}: "${block.text.slice(0, 30)}"`);
                         html += `<span class="highlight-block">${escaped}</span>`;
                     } else {
                         html += escaped;
