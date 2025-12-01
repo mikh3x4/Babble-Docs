@@ -55,28 +55,39 @@ def get_context(sentences: list[str], idx: int, window: int = 5) -> tuple[list[s
 
 # --- Translation ---
 
+class TranslationError(Exception):
+    """Raised when translation fails."""
+    pass
+
 def translate_sentence(sentence: str, context_before: list[str], context_after: list[str],
                        source_lang: str, target_lang: str) -> str:
     """Translate a single sentence using Claude, with surrounding context."""
-    client = anthropic.Anthropic()
+    try:
+        client = anthropic.Anthropic()
 
-    context_text = ""
-    if context_before:
-        context_text += f"Previous sentences (for context only):\n{join_sentences(context_before)}\n\n"
-    if context_after:
-        context_text += f"Following sentences (for context only):\n{join_sentences(context_after)}\n\n"
+        context_text = ""
+        if context_before:
+            context_text += f"Previous sentences (for context only):\n{join_sentences(context_before)}\n\n"
+        if context_after:
+            context_text += f"Following sentences (for context only):\n{join_sentences(context_after)}\n\n"
 
-    prompt = f"""{context_text}Translate this single sentence from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}:
+        prompt = f"""{context_text}Translate this single sentence from {LANGUAGES[source_lang]} to {LANGUAGES[target_lang]}:
 "{sentence}"
 
 Return ONLY the translated sentence, nothing else. No quotes."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.content[0].text.strip()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+    except anthropic.RateLimitError:
+        raise TranslationError("Rate limit exceeded. Please wait and try again.")
+    except anthropic.APIConnectionError:
+        raise TranslationError("Network error. Check your connection.")
+    except anthropic.APIError as e:
+        raise TranslationError(f"API error: {e.message}")
 
 # --- WebSocket Broadcasting ---
 
@@ -180,30 +191,37 @@ async def websocket_endpoint(ws: WebSocket):
                 before, _, after = get_context(sentences, sentence_idx)
 
                 # Translate and insert in other languages
-                for target_lang in LANGUAGES:
-                    if target_lang == source_lang:
-                        continue
+                try:
+                    for target_lang in LANGUAGES:
+                        if target_lang == source_lang:
+                            continue
 
-                    target_sentences = split_sentences(read_doc(target_lang))
+                        target_sentences = split_sentences(read_doc(target_lang))
 
-                    # Translate the new sentence
-                    translated = translate_sentence(
-                        new_sentence, before, after, source_lang, target_lang
-                    )
+                        # Translate the new sentence
+                        translated = translate_sentence(
+                            new_sentence, before, after, source_lang, target_lang
+                        )
 
-                    # Insert at the correct position
-                    target_sentences.insert(sentence_idx, translated)
+                        # Insert at the correct position
+                        target_sentences.insert(sentence_idx, translated)
 
-                    new_content = join_sentences(target_sentences)
-                    write_doc(target_lang, new_content)
+                        new_content = join_sentences(target_sentences)
+                        write_doc(target_lang, new_content)
 
-                    await broadcast_to_language(target_lang, {
-                        "type": "content",
-                        "language": target_lang,
-                        "content": new_content
+                        await broadcast_to_language(target_lang, {
+                            "type": "content",
+                            "language": target_lang,
+                            "content": new_content
+                        })
+
+                    await broadcast({"type": "translation_complete", "sentence_index": sentence_idx})
+                except TranslationError as e:
+                    await broadcast({
+                        "type": "translation_error",
+                        "sentence_index": sentence_idx,
+                        "error": str(e)
                     })
-
-                await broadcast({"type": "translation_complete", "sentence_index": sentence_idx})
 
             elif msg_type == "edit":
                 # Client made an edit
@@ -227,36 +245,43 @@ async def websocket_endpoint(ws: WebSocket):
                 before, _, after = get_context(sentences, sentence_idx)
 
                 # Translate to other languages
-                for target_lang in LANGUAGES:
-                    if target_lang == source_lang:
-                        continue
+                try:
+                    for target_lang in LANGUAGES:
+                        if target_lang == source_lang:
+                            continue
 
-                    # Read current target doc
-                    target_content = read_doc(target_lang)
-                    target_sentences = split_sentences(target_content)
+                        # Read current target doc
+                        target_content = read_doc(target_lang)
+                        target_sentences = split_sentences(target_content)
 
-                    # Ensure we have enough sentences (pad if needed)
-                    while len(target_sentences) <= sentence_idx:
-                        target_sentences.append("")
+                        # Ensure we have enough sentences (pad if needed)
+                        while len(target_sentences) <= sentence_idx:
+                            target_sentences.append("")
 
-                    # Translate the sentence
-                    translated = translate_sentence(
-                        new_sentence, before, after, source_lang, target_lang
-                    )
-                    target_sentences[sentence_idx] = translated
+                        # Translate the sentence
+                        translated = translate_sentence(
+                            new_sentence, before, after, source_lang, target_lang
+                        )
+                        target_sentences[sentence_idx] = translated
 
-                    # Save and broadcast
-                    new_content = join_sentences(target_sentences)
-                    write_doc(target_lang, new_content)
+                        # Save and broadcast
+                        new_content = join_sentences(target_sentences)
+                        write_doc(target_lang, new_content)
 
-                    await broadcast_to_language(target_lang, {
-                        "type": "content",
-                        "language": target_lang,
-                        "content": new_content
+                        await broadcast_to_language(target_lang, {
+                            "type": "content",
+                            "language": target_lang,
+                            "content": new_content
+                        })
+
+                    # Notify translation complete
+                    await broadcast({"type": "translation_complete", "sentence_index": sentence_idx})
+                except TranslationError as e:
+                    await broadcast({
+                        "type": "translation_error",
+                        "sentence_index": sentence_idx,
+                        "error": str(e)
                     })
-
-                # Notify translation complete
-                await broadcast({"type": "translation_complete", "sentence_index": sentence_idx})
 
     except WebSocketDisconnect:
         clients.pop(ws, None)
