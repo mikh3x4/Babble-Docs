@@ -101,12 +101,23 @@ async def broadcast_to_language(lang: str, message: dict, exclude: WebSocket = N
             except:
                 clients.pop(ws, None)
 
+async def broadcast_connection_stats():
+    """Broadcast current connection stats to all clients."""
+    from collections import Counter
+    lang_counts = Counter(clients.values())
+    await broadcast({
+        "type": "connection_stats",
+        "total": len(clients),
+        "by_language": dict(lang_counts)
+    })
+
 # --- WebSocket Handler ---
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     clients[ws] = "en"  # default language
+    await broadcast_connection_stats()
 
     try:
         while True:
@@ -116,7 +127,9 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "load":
                 # Client wants to load a language version
                 lang = data.get("language", "en")
-                clients[ws] = lang
+                if clients[ws] != lang:
+                    clients[ws] = lang
+                    await broadcast_connection_stats()
                 await ws.send_json({"type": "content", "language": lang, "content": read_doc(lang)})
 
             elif msg_type == "delete":
@@ -247,6 +260,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         clients.pop(ws, None)
+        await broadcast_connection_stats()
 
 # --- Static Files ---
 
