@@ -107,7 +107,11 @@ def undo_last() -> dict | None:
     return previous["documents"]
 
 def split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Handles ., !, ? followed by space or end."""
+    """Split text into sentences. Handles ., !, ? followed by space or end.
+
+    Returns a list of sentences. Use split_sentences_with_separators() if you
+    need to preserve original whitespace/formatting.
+    """
     if not text.strip():
         logger.debug(f"split_sentences: empty text, returning []")
         return []
@@ -117,8 +121,77 @@ def split_sentences(text: str) -> list[str]:
     logger.debug(f"split_sentences: {len(result)} sentences from {len(text)} chars")
     return result
 
-def join_sentences(sentences: list[str]) -> str:
-    return " ".join(sentences)
+def split_sentences_with_separators(text: str) -> tuple[list[str], list[str]]:
+    """Split text into sentences while preserving the separators between them.
+
+    Returns:
+        tuple of (sentences, separators) where separators[i] is the whitespace
+        that appeared after sentences[i]. The last separator is always empty string.
+    """
+    if not text.strip():
+        logger.debug(f"split_sentences_with_separators: empty text, returning ([], [])")
+        return [], []
+
+    # Use findall to capture both sentences and separators
+    # Pattern: sentence ending with .!? followed by optional whitespace
+    pattern = r'(.*?[.!?])(\s*)'
+    matches = re.findall(pattern, text.strip(), re.DOTALL)
+
+    if not matches:
+        # No sentence-ending punctuation found, treat entire text as one sentence
+        stripped = text.strip()
+        if stripped:
+            return [stripped], ['']
+        return [], []
+
+    sentences = []
+    separators = []
+
+    for sentence, separator in matches:
+        sentence = sentence.strip()
+        if sentence:
+            sentences.append(sentence)
+            # Normalize separator: preserve paragraph breaks (2+ newlines), otherwise use space
+            if '\n\n' in separator or separator.count('\n') >= 2:
+                separators.append('\n\n')
+            elif separator:
+                separators.append(' ')
+            else:
+                separators.append('')
+
+    # Ensure last separator is empty (nothing after last sentence)
+    if separators:
+        separators[-1] = ''
+
+    logger.debug(f"split_sentences_with_separators: {len(sentences)} sentences from {len(text)} chars")
+    return sentences, separators
+
+def join_sentences(sentences: list[str], separators: list[str] = None) -> str:
+    """Join sentences back together with proper spacing.
+
+    Args:
+        sentences: List of sentence strings
+        separators: Optional list of separators between sentences. If not provided,
+                   sentences are joined with single spaces.
+
+    Returns:
+        Joined text with proper spacing.
+    """
+    if not sentences:
+        return ""
+
+    if separators is None or len(separators) != len(sentences):
+        # Default behavior: join with single space
+        return " ".join(sentences)
+
+    # Use provided separators
+    result = []
+    for i, sentence in enumerate(sentences):
+        result.append(sentence)
+        if i < len(sentences) - 1 and separators[i]:
+            result.append(separators[i])
+
+    return "".join(result)
 
 def get_context(sentences: list[str], idx: int, window: int = 5) -> tuple[list[str], str, list[str]]:
     """Get sentences before, the target sentence, and sentences after."""
@@ -374,13 +447,16 @@ async def websocket_endpoint(ws: WebSocket):
                     if target_lang == source_lang:
                         continue
 
-                    target_sentences = split_sentences(read_doc(target_lang))
+                    target_sentences, target_separators = split_sentences_with_separators(read_doc(target_lang))
                     logger.debug(f"Delete: {target_lang} has {len(target_sentences)} sentences, deleting idx {sentence_idx}")
                     if sentence_idx < len(target_sentences):
                         deleted_sentence = target_sentences[sentence_idx]
                         logger.debug(f"Delete: removing sentence '{deleted_sentence[:50]}...' from {target_lang}")
                         del target_sentences[sentence_idx]
-                        new_content = join_sentences(target_sentences)
+                        # Also remove the corresponding separator
+                        if sentence_idx < len(target_separators):
+                            del target_separators[sentence_idx]
+                        new_content = join_sentences(target_sentences, target_separators)
                         write_doc(target_lang, new_content)
 
                         await broadcast_to_language(target_lang, {
@@ -429,7 +505,7 @@ async def websocket_endpoint(ws: WebSocket):
                         if target_lang == source_lang:
                             continue
 
-                        target_sentences = split_sentences(read_doc(target_lang))
+                        target_sentences, target_separators = split_sentences_with_separators(read_doc(target_lang))
                         logger.debug(f"Insert: {target_lang} has {len(target_sentences)} sentences before insert")
 
                         # Translate the new sentence
@@ -440,9 +516,14 @@ async def websocket_endpoint(ws: WebSocket):
 
                         # Insert at the correct position
                         target_sentences.insert(sentence_idx, translated)
+                        # Insert a default separator (single space) for the new sentence
+                        if sentence_idx < len(target_separators):
+                            target_separators.insert(sentence_idx, ' ')
+                        else:
+                            target_separators.append(' ')
                         logger.debug(f"Insert: {target_lang} now has {len(target_sentences)} sentences after insert")
 
-                        new_content = join_sentences(target_sentences)
+                        new_content = join_sentences(target_sentences, target_separators)
                         write_doc(target_lang, new_content)
 
                         await broadcast_to_language(target_lang, {
@@ -499,13 +580,14 @@ async def websocket_endpoint(ws: WebSocket):
 
                         # Read current target doc
                         target_content = read_doc(target_lang)
-                        target_sentences = split_sentences(target_content)
+                        target_sentences, target_separators = split_sentences_with_separators(target_content)
                         logger.debug(f"Edit: {target_lang} has {len(target_sentences)} sentences, editing idx {sentence_idx}")
 
                         # Ensure we have enough sentences (pad if needed)
                         original_len = len(target_sentences)
                         while len(target_sentences) <= sentence_idx:
                             target_sentences.append("")
+                            target_separators.append(' ')
                         if len(target_sentences) > original_len:
                             logger.debug(f"Edit: padded {target_lang} from {original_len} to {len(target_sentences)} sentences")
 
@@ -519,7 +601,7 @@ async def websocket_endpoint(ws: WebSocket):
                         target_sentences[sentence_idx] = translated
 
                         # Save and broadcast
-                        new_content = join_sentences(target_sentences)
+                        new_content = join_sentences(target_sentences, target_separators)
                         write_doc(target_lang, new_content)
 
                         await broadcast_to_language(target_lang, {

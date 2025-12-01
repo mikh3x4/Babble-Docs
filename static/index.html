@@ -150,13 +150,68 @@
             return text.trim().split(/(?<=[.!?])\s+/).filter(s => s);
         };
 
+        // Split text into sentences while preserving separators
+        const splitSentencesWithSeparators = (text) => {
+            if (!text.trim()) return { sentences: [], separators: [] };
+
+            const pattern = /(.*?[.!?])(\s*)/gs;
+            const sentences = [];
+            const separators = [];
+            let match;
+
+            while ((match = pattern.exec(text.trim())) !== null) {
+                const sentence = match[1].trim();
+                const separator = match[2];
+
+                if (sentence) {
+                    sentences.push(sentence);
+                    // Normalize: preserve paragraph breaks (2+ newlines), otherwise single space
+                    if (separator.includes('\n\n') || (separator.match(/\n/g) || []).length >= 2) {
+                        separators.push('\n\n');
+                    } else if (separator) {
+                        separators.push(' ');
+                    } else {
+                        separators.push('');
+                    }
+                }
+            }
+
+            // Ensure last separator is empty
+            if (separators.length > 0) {
+                separators[separators.length - 1] = '';
+            }
+
+            return { sentences, separators };
+        };
+
+        // Join sentences with proper spacing
+        const joinSentences = (sentences, separators = null) => {
+            if (!sentences || sentences.length === 0) return '';
+
+            if (!separators || separators.length !== sentences.length) {
+                return sentences.join(' ');
+            }
+
+            let result = '';
+            for (let i = 0; i < sentences.length; i++) {
+                result += sentences[i];
+                if (i < sentences.length - 1 && separators[i]) {
+                    result += separators[i];
+                }
+            }
+            return result;
+        };
+
         // Apply pending translation: insert original text at sentence index
         const applyPendingTranslation = (index, originalText) => {
-            const sentences = splitSentences(editor.value);
+            const { sentences, separators } = splitSentencesWithSeparators(editor.value);
             // Insert or replace at the given index
-            while (sentences.length <= index) sentences.push('');
+            while (sentences.length <= index) {
+                sentences.push('');
+                separators.push(' ');
+            }
             sentences[index] = originalText;
-            editor.value = sentences.join(' ');
+            editor.value = joinSentences(sentences, separators);
             previousContent = editor.value;
             updateHighlightOverlay();
         };
@@ -169,17 +224,23 @@
                 editorHighlight.innerHTML = '';
                 return;
             }
-            const sentences = splitSentences(text);
-            const html = sentences.map((s, i) => {
+            const { sentences, separators } = splitSentencesWithSeparators(text);
+            const htmlParts = sentences.map((s, i) => {
                 const escaped = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                let sentenceHtml;
                 if (pendingTranslations[i]) {
-                    return `<span class="pending-translation">${escaped}</span>`;
+                    sentenceHtml = `<span class="pending-translation">${escaped}</span>`;
+                } else if (translatingIndices.has(i)) {
+                    sentenceHtml = `<span class="sentence-highlight">${escaped}</span>`;
+                } else {
+                    sentenceHtml = escaped;
                 }
-                return translatingIndices.has(i)
-                    ? `<span class="sentence-highlight">${escaped}</span>`
-                    : escaped;
-            }).join(' ');
-            editorHighlight.innerHTML = html;
+                // Add separator after this sentence (convert newlines to <br> for HTML)
+                const sep = (i < sentences.length - 1 && separators[i]) ? separators[i] : '';
+                const htmlSep = sep === '\n\n' ? '<br><br>' : sep;
+                return sentenceHtml + htmlSep;
+            });
+            editorHighlight.innerHTML = htmlParts.join('');
         };
 
         // Find all sentences that changed between old and new text
