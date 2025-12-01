@@ -32,6 +32,9 @@
             white-space: pre-wrap; word-wrap: break-word;
             border: 2px solid transparent; border-radius: 8px;
             overflow: hidden;
+            color: transparent;
+            background: white;
+            z-index: 0;
         }
 
         #editor {
@@ -41,6 +44,7 @@
             background: transparent; resize: vertical;
             font-family: system-ui, sans-serif;
             position: relative;
+            z-index: 1;
         }
         #editor:focus { outline: none; border-color: #007bff; }
 
@@ -124,7 +128,6 @@
         const updateHighlights = () => {
             if (translatingBlocks.length === 0) {
                 highlightLayer.innerHTML = '';
-                highlightLayer.style.background = 'white';
                 return;
             }
 
@@ -152,7 +155,6 @@
             }
 
             highlightLayer.innerHTML = html;
-            highlightLayer.style.background = 'white';
         };
 
         const connect = () => {
@@ -189,6 +191,7 @@
 
                 if (msg.type === 'translating') {
                     translatingBlocks = msg.blocks || [];
+                    console.log('Translating blocks:', translatingBlocks);
                     if (translatingBlocks.length > 0) {
                         translatingStatus.classList.add('active');
                     } else {
