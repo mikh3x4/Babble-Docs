@@ -151,38 +151,54 @@
             editorHighlight.innerHTML = html;
         };
 
-        // Find which sentence changed between old and new text
-        const findChangedSentence = (oldText, newText) => {
+        // Find all sentences that changed between old and new text
+        // Returns an array of changes to handle multiple insertions/deletions
+        const findChangedSentences = (oldText, newText) => {
             const oldSentences = splitSentences(oldText);
             const newSentences = splitSentences(newText);
+            const changes = [];
 
             // Detect deletion: fewer sentences than before
             if (newSentences.length < oldSentences.length) {
                 for (let i = 0; i < newSentences.length; i++) {
                     if (oldSentences[i] !== newSentences[i]) {
-                        return { type: 'delete', index: i };
+                        return [{ type: 'delete', index: i }];
                     }
                 }
-                return { type: 'delete', index: newSentences.length };
+                return [{ type: 'delete', index: newSentences.length }];
             }
 
             // Detect insertion: more sentences than before
             if (newSentences.length > oldSentences.length) {
-                for (let i = 0; i < newSentences.length; i++) {
+                const numInserted = newSentences.length - oldSentences.length;
+                // Find where the insertion starts
+                let insertStart = 0;
+                for (let i = 0; i < oldSentences.length; i++) {
                     if (oldSentences[i] !== newSentences[i]) {
-                        return { type: 'insert', index: i, sentence: newSentences[i] };
+                        insertStart = i;
+                        break;
+                    } else {
+                        insertStart = i + 1;
                     }
                 }
-                return { type: 'insert', index: newSentences.length - 1, sentence: newSentences[newSentences.length - 1] };
+                // Return all inserted sentences
+                for (let i = 0; i < numInserted; i++) {
+                    changes.push({
+                        type: 'insert',
+                        index: insertStart + i,
+                        sentence: newSentences[insertStart + i]
+                    });
+                }
+                return changes;
             }
 
             // Same count: find edited sentence
             for (let i = 0; i < newSentences.length; i++) {
                 if (oldSentences[i] !== newSentences[i]) {
-                    return { type: 'edit', index: i, sentence: newSentences[i] };
+                    return [{ type: 'edit', index: i, sentence: newSentences[i] }];
                 }
             }
-            return null;
+            return [];
         };
 
         const connect = () => {
@@ -284,15 +300,18 @@
             updateHighlightOverlay();
             clearTimeout(editTimeout);
             editTimeout = setTimeout(() => {
-                const change = findChangedSentence(previousContent, editor.value);
-                if (change && ws?.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({
-                        type: change.type,
-                        language: currentLang,
-                        sentence_index: change.index,
-                        new_sentence: change.sentence,
-                        full_content: editor.value
-                    }));
+                const changes = findChangedSentences(previousContent, editor.value);
+                if (changes.length > 0 && ws?.readyState === WebSocket.OPEN) {
+                    // Send all changes (handles multiple sentence insertions)
+                    for (const change of changes) {
+                        ws.send(JSON.stringify({
+                            type: change.type,
+                            language: currentLang,
+                            sentence_index: change.index,
+                            new_sentence: change.sentence,
+                            full_content: editor.value
+                        }));
+                    }
                     previousContent = editor.value;
                 }
             }, 500);
