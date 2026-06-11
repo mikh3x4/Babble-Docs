@@ -1,54 +1,37 @@
-# Babbel Docs - Agent Tasks
+# Babbel Docs - Agent Notes
 
 ## Quick Start
 ```bash
 source venv/bin/activate && python main.py
 # Open http://localhost:8000
+pytest tests/ -q
 ```
 
 ## Files
-- `main.py` - Backend (FastAPI + WebSocket + translation)
-- `static/index.html` - Frontend (vanilla JS)
-- `docs/*.txt` - Per-language document storage
+- `main.py` - Backend: REST (docs/languages/PDF export), per-document WebSocket
+  rooms, block merge, debounced per-block translation (AsyncAnthropic).
+- `static/app.js` - Frontend: ProseMirror editor, sidebar, toolbar, WS sync.
+- `static/vendor/prosemirror.js` - Committed ESM bundle (rebuild with esbuild
+  from prosemirror-* packages if upgrading; no runtime CDN dependency).
+- `docs/*.json` - One JSON file per document (gitignored).
+- `tests/test_main.py` - Unit tests for sanitizer/merge/render/PDF html.
+
+## Architecture
+A document is a flat list of blocks `{id, type, attrs, content: {lang: html},
+source, pending}`. Clients send their language's block list over WS; blocks
+without an "html" key are untouched (they may be displaying fallback text from
+another language - never treat that as content). Merging is by block id, so
+unchanged and reordered blocks keep their translations. Changed blocks become
+the new source and are retranslated to the document's other languages
+(per-block debounce, cancel-on-reedit, keyed by block id).
+
+## Invariants to keep
+- Block ids are stable across edits, type toggles, and list wrap/lift
+  (frontend idPlugin adopts paragraph ids into list items and back).
+- Inline HTML is sanitized server-side (`ALLOWED_TAGS`) - everything sent to
+  clients or the PDF renderer has passed `sanitize_inline_html`.
+- Code blocks and empty blocks are copied verbatim to all languages, never
+  translated.
 
 ## Style
 Short, elegant, functional. Minimize files. Readability > extensibility.
-
----
-
-## Tasks
-
-### 1. Sentence deletion
-**File**: `main.py`
-**Do**: When user deletes a sentence, remove corresponding sentence from all language versions.
-**Check**: Delete sentence 2 in English → sentence 2 gone in Polish/Mandarin too.
-
-### 2. Sentence insertion
-**File**: `main.py`
-**Do**: When user adds a new sentence (not edits existing), translate and insert at correct index in other languages.
-**Check**: Add sentence between 1 and 2 → appears translated at same position in other languages.
-
-### 3. Connection status
-**File**: `static/index.html`, `main.py`
-**Do**: Show "3 users online (2 en, 1 pl)" - update in real-time.
-**Check**: Open 3 tabs with different languages, see count update.
-
-### 4. Sentence highlighting during translation
-**File**: `static/index.html`
-**Do**: Highlight the specific sentence being translated (yellow/orange background) instead of just showing "translating sentence X".
-**Check**: Edit in one tab → other tabs show that sentence highlighted until translation completes.
-
-### 5. Basic tests
-**File**: `tests/test_main.py`
-**Do**: Test `split_sentences()`, `get_context()`, `join_sentences()` with edge cases.
-**Check**: `pytest tests/ -v` passes.
-
-### 6. API error handling
-**File**: `main.py`
-**Do**: Catch Anthropic API failures (rate limits, network). Broadcast error to clients. Allow retry.
-**Check**: Disconnect network mid-translation → user sees error message, can retry.
-
-### 7. Edit history
-**File**: `main.py`
-**Do**: Log edits with timestamps to JSON. Basic undo (revert to previous).
-**Check**: Make edits, call undo → reverts to previous state.

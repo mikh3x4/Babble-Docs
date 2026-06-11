@@ -1,196 +1,171 @@
-"""Tests for core utility functions in main.py."""
-import pytest
+"""Tests for the core document logic: sanitizing, merging, rendering, PDF html."""
 import sys
 from pathlib import Path
 
-# Add parent directory to path to import main
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from main import split_sentences, get_context, join_sentences
-
-
-# --- split_sentences tests ---
-
-def test_split_sentences_empty():
-    """Empty string returns empty list."""
-    assert split_sentences("") == []
-    assert split_sentences("   ") == []
-    assert split_sentences("\n\t") == []
+from main import (
+    sanitize_inline_html, merge_blocks, render_blocks, blocks_to_html,
+)
 
 
-def test_split_sentences_single():
-    """Single sentence returns list with one element."""
-    assert split_sentences("Hello world.") == ["Hello world."]
-    assert split_sentences("Is this a question?") == ["Is this a question?"]
-    assert split_sentences("Wow!") == ["Wow!"]
+def make_doc(blocks=None, languages=None):
+    return {
+        "id": "d1",
+        "title": "Test",
+        "languages": languages or [
+            {"code": "en", "name": "English"},
+            {"code": "pl", "name": "Polish"},
+        ],
+        "blocks": blocks or [],
+        "updated_at": 0,
+    }
 
 
-def test_split_sentences_multiple():
-    """Multiple sentences are split correctly."""
-    text = "First sentence. Second sentence. Third sentence."
-    assert split_sentences(text) == [
-        "First sentence.",
-        "Second sentence.",
-        "Third sentence."
-    ]
+def block(bid, html_by_lang, btype="paragraph", source="en", pending=None, attrs=None):
+    return {"id": bid, "type": btype, "attrs": attrs or {}, "content": html_by_lang,
+            "source": source, "pending": pending or []}
 
 
-def test_split_sentences_mixed_punctuation():
-    """Handles mixed punctuation types."""
-    text = "Hello! How are you? I am fine."
-    assert split_sentences(text) == ["Hello!", "How are you?", "I am fine."]
+# --- sanitizer ---------------------------------------------------------------
+
+def test_sanitizer_keeps_formatting_tags():
+    assert sanitize_inline_html("a <strong>b</strong> <em>c</em>") == "a <strong>b</strong> <em>c</em>"
 
 
-def test_split_sentences_preserves_internal_punctuation():
-    """Punctuation not followed by space is preserved."""
-    text = "Visit example.com today. It's great!"
-    result = split_sentences(text)
-    assert result == ["Visit example.com today.", "It's great!"]
+def test_sanitizer_strips_script_and_events():
+    assert sanitize_inline_html('<script>alert(1)</script>hi') == "alert(1)hi"
+    assert sanitize_inline_html('<strong onclick="x()">b</strong>') == "<strong>b</strong>"
 
 
-def test_split_sentences_no_trailing_space():
-    """Sentence without trailing space at end works."""
-    text = "One. Two"
-    result = split_sentences(text)
-    assert result == ["One.", "Two"]
+def test_sanitizer_restricts_link_protocols():
+    assert 'href=""' in sanitize_inline_html('<a href="javascript:alert(1)">x</a>')
+    assert 'href="https://a.b"' in sanitize_inline_html('<a href="https://a.b">x</a>')
 
 
-def test_split_sentences_extra_whitespace():
-    """Extra whitespace is handled."""
-    text = "First.   Second.    Third."
-    result = split_sentences(text)
-    assert result == ["First.", "Second.", "Third."]
+def test_sanitizer_closes_unclosed_tags():
+    assert sanitize_inline_html("<strong>abc") == "<strong>abc</strong>"
 
 
-def test_split_sentences_with_numbers():
-    """Numbers with decimals don't cause incorrect splits."""
-    text = "The price is $9.99 today. Buy now!"
-    result = split_sentences(text)
-    # Note: this tests current behavior - 9.99 followed by space may split
-    assert len(result) >= 1
+def test_sanitizer_escapes_text():
+    assert sanitize_inline_html("1 < 2 & 3") == "1 &lt; 2 &amp; 3"
 
 
-# --- join_sentences tests ---
+# --- merge_blocks -------------------------------------------------------------
 
-def test_join_sentences_empty():
-    """Empty list returns empty string."""
-    assert join_sentences([]) == ""
-
-
-def test_join_sentences_single():
-    """Single sentence is returned as-is."""
-    assert join_sentences(["Hello."]) == "Hello."
-
-
-def test_join_sentences_multiple():
-    """Multiple sentences are joined with spaces."""
-    sentences = ["First.", "Second.", "Third."]
-    assert join_sentences(sentences) == "First. Second. Third."
+def test_merge_new_block_needs_translation():
+    doc = make_doc()
+    dirty = merge_blocks(doc, [{"id": "b1", "type": "paragraph", "html": "Hello"}], "en")
+    assert dirty == ["b1"]
+    assert doc["blocks"][0]["content"] == {"en": "Hello"}
+    assert doc["blocks"][0]["pending"] == ["pl"]
+    assert doc["blocks"][0]["source"] == "en"
 
 
-def test_join_sentences_roundtrip():
-    """split_sentences and join_sentences are inverse operations."""
-    original = "Hello world. How are you? I am fine!"
-    sentences = split_sentences(original)
-    rejoined = join_sentences(sentences)
-    assert rejoined == original
+def test_merge_unchanged_block_keeps_translations():
+    doc = make_doc([block("b1", {"en": "Hello", "pl": "Cześć"})])
+    dirty = merge_blocks(doc, [{"id": "b1", "type": "paragraph", "html": "Hello"}], "en")
+    assert dirty == []
+    assert doc["blocks"][0]["content"]["pl"] == "Cześć"
 
 
-def test_join_sentences_roundtrip_complex():
-    """Roundtrip with more complex text."""
-    original = "The cat sat. The dog ran! Did the bird fly?"
-    sentences = split_sentences(original)
-    rejoined = join_sentences(sentences)
-    assert rejoined == original
+def test_merge_omitted_html_means_untouched():
+    # A pl client displaying en fallback text must not overwrite pl content.
+    doc = make_doc([block("b1", {"en": "Hello"}, pending=["pl"])])
+    dirty = merge_blocks(doc, [{"id": "b1", "type": "paragraph"}], "pl")
+    assert dirty == []
+    assert doc["blocks"][0]["content"] == {"en": "Hello"}
+    assert doc["blocks"][0]["pending"] == ["pl"]
 
 
-# --- get_context tests ---
-
-def test_get_context_middle():
-    """Context extraction from middle of list."""
-    sentences = ["S0.", "S1.", "S2.", "S3.", "S4.", "S5.", "S6.", "S7.", "S8.", "S9.", "S10."]
-    before, target, after = get_context(sentences, 5)
-
-    assert target == "S5."
-    assert before == ["S0.", "S1.", "S2.", "S3.", "S4."]
-    assert after == ["S6.", "S7.", "S8.", "S9.", "S10."]
+def test_merge_edit_invalidates_other_languages():
+    doc = make_doc([block("b1", {"en": "Hello", "pl": "Cześć"})])
+    dirty = merge_blocks(doc, [{"id": "b1", "type": "paragraph", "html": "Goodbye"}], "en")
+    assert dirty == ["b1"]
+    assert doc["blocks"][0]["pending"] == ["pl"]
+    assert doc["blocks"][0]["content"]["pl"] == "Cześć"  # kept for display until retranslated
 
 
-def test_get_context_beginning():
-    """Context at beginning has fewer sentences before."""
-    sentences = ["S0.", "S1.", "S2.", "S3.", "S4.", "S5.", "S6."]
-    before, target, after = get_context(sentences, 0)
-
-    assert target == "S0."
-    assert before == []
-    assert after == ["S1.", "S2.", "S3.", "S4.", "S5."]
+def test_merge_type_change_without_text_change_keeps_translations():
+    doc = make_doc([block("b1", {"en": "Hello", "pl": "Cześć"})])
+    dirty = merge_blocks(doc, [{"id": "b1", "type": "heading", "attrs": {"level": 1}}], "en")
+    assert dirty == []
+    assert doc["blocks"][0]["type"] == "heading"
+    assert doc["blocks"][0]["content"]["pl"] == "Cześć"
 
 
-def test_get_context_near_beginning():
-    """Context near beginning has fewer than window sentences before."""
-    sentences = ["S0.", "S1.", "S2.", "S3.", "S4.", "S5.", "S6."]
-    before, target, after = get_context(sentences, 2)
-
-    assert target == "S2."
-    assert before == ["S0.", "S1."]  # Only 2 sentences before
-    assert after == ["S3.", "S4.", "S5.", "S6."]
+def test_merge_deletion():
+    doc = make_doc([block("b1", {"en": "One"}), block("b2", {"en": "Two"})])
+    merge_blocks(doc, [{"id": "b2", "type": "paragraph"}], "en")
+    assert [b["id"] for b in doc["blocks"]] == ["b2"]
 
 
-def test_get_context_end():
-    """Context at end has fewer sentences after."""
-    sentences = ["S0.", "S1.", "S2.", "S3.", "S4.", "S5.", "S6."]
-    before, target, after = get_context(sentences, 6)
-
-    assert target == "S6."
-    assert before == ["S1.", "S2.", "S3.", "S4.", "S5."]
-    assert after == []
+def test_merge_reorder_preserves_content():
+    doc = make_doc([block("b1", {"en": "One", "pl": "Raz"}), block("b2", {"en": "Two", "pl": "Dwa"})])
+    dirty = merge_blocks(doc, [{"id": "b2", "type": "paragraph"}, {"id": "b1", "type": "paragraph"}], "en")
+    assert dirty == []
+    assert [b["content"]["pl"] for b in doc["blocks"]] == ["Dwa", "Raz"]
 
 
-def test_get_context_near_end():
-    """Context near end has fewer than window sentences after."""
-    sentences = ["S0.", "S1.", "S2.", "S3.", "S4.", "S5.", "S6."]
-    before, target, after = get_context(sentences, 4)
-
-    assert target == "S4."
-    assert before == ["S0.", "S1.", "S2.", "S3."]  # Window caps at idx-1
-    assert after == ["S5.", "S6."]  # Only 2 sentences after
+def test_merge_duplicate_ids_get_reassigned():
+    doc = make_doc()
+    merge_blocks(doc, [{"id": "b1", "html": "a", "type": "paragraph"},
+                       {"id": "b1", "html": "b", "type": "paragraph"}], "en")
+    ids = [b["id"] for b in doc["blocks"]]
+    assert len(set(ids)) == 2
 
 
-def test_get_context_small_list():
-    """Context from very small list."""
-    sentences = ["Only.", "Two."]
-    before, target, after = get_context(sentences, 0)
-
-    assert target == "Only."
-    assert before == []
-    assert after == ["Two."]
+def test_merge_code_blocks_skip_translation():
+    doc = make_doc()
+    dirty = merge_blocks(doc, [{"id": "b1", "type": "code", "html": "x = 1"}], "en")
+    assert dirty == []
+    assert doc["blocks"][0]["content"]["pl"] == "x = 1"
 
 
-def test_get_context_single_sentence():
-    """Context from single-sentence list."""
-    sentences = ["Alone."]
-    before, target, after = get_context(sentences, 0)
-
-    assert target == "Alone."
-    assert before == []
-    assert after == []
+def test_merge_empty_blocks_skip_translation():
+    doc = make_doc()
+    dirty = merge_blocks(doc, [{"id": "b1", "type": "paragraph", "html": ""}], "en")
+    assert dirty == []
+    assert doc["blocks"][0]["pending"] == []
 
 
-def test_get_context_custom_window():
-    """Custom window size works."""
-    sentences = ["S0.", "S1.", "S2.", "S3.", "S4.", "S5.", "S6."]
-    before, target, after = get_context(sentences, 3, window=2)
+# --- render_blocks ---------------------------------------------------------------
 
-    assert target == "S3."
-    assert before == ["S1.", "S2."]  # Only 2 sentences
-    assert after == ["S4.", "S5."]   # Only 2 sentences
+def test_render_translated_language():
+    doc = make_doc([block("b1", {"en": "Hello", "pl": "Cześć"})])
+    out = render_blocks(doc, "pl")
+    assert out[0]["html"] == "Cześć"
+    assert out[0]["pending"] is False
 
 
-def test_get_context_out_of_bounds():
-    """Index beyond list returns empty target."""
-    sentences = ["S0.", "S1."]
-    before, target, after = get_context(sentences, 5)
+def test_render_falls_back_to_source_and_flags_pending():
+    doc = make_doc([block("b1", {"en": "Hello"}, pending=["pl"])])
+    out = render_blocks(doc, "pl")
+    assert out[0]["html"] == "Hello"
+    assert out[0]["pending"] is True
 
-    assert target == ""
-    assert before == ["S0.", "S1."]
-    assert after == []
+
+# --- PDF html ----------------------------------------------------------------------
+
+def test_blocks_to_html_groups_lists_and_escapes_title():
+    doc = make_doc([
+        block("b1", {"en": "Title"}, btype="heading", attrs={"level": 1}),
+        block("b2", {"en": "one"}, btype="list_item", attrs={"list": "bullet"}),
+        block("b3", {"en": "two"}, btype="list_item", attrs={"list": "bullet"}),
+        block("b4", {"en": "after"}),
+    ])
+    doc["title"] = "<Doc>"
+    html = blocks_to_html(doc, "en")
+    assert "&lt;Doc&gt;" in html
+    assert html.count("<ul>") == 1 and html.count("</ul>") == 1
+    assert "<li>one</li><li>two</li>" in html
+    assert "<h1>Title</h1>" in html
+
+
+def test_blocks_to_html_switches_list_kind():
+    doc = make_doc([
+        block("b1", {"en": "a"}, btype="list_item", attrs={"list": "bullet"}),
+        block("b2", {"en": "b"}, btype="list_item", attrs={"list": "ordered"}),
+    ])
+    html = blocks_to_html(doc, "en")
+    assert "</ul><ol>" in html

@@ -1,260 +1,74 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Babbel Docs</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: system-ui, sans-serif;
-            max-width: 800px; margin: 0 auto; padding: 2rem;
-            background: #f5f5f5;
-        }
-        header {
-            display: flex; justify-content: space-between;
-            align-items: center; margin-bottom: 1rem;
-        }
-        h1 { font-size: 1.5rem; color: #333; }
-        select {
-            padding: 0.5rem 1rem; font-size: 1rem;
-            border: 1px solid #ccc; border-radius: 4px;
-            margin-left: 0.5rem;
-        }
-
-        .editor-wrap { position: relative; }
-
-        #highlight-layer {
-            position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-            padding: 1rem; pointer-events: none;
-            font-size: 1rem; line-height: 1.6;
-            font-family: system-ui, sans-serif;
-            white-space: pre-wrap; word-wrap: break-word;
-            border: 2px solid transparent; border-radius: 8px;
-            overflow: hidden;
-            color: transparent;
-            background: white;
-            z-index: 0;
-        }
-
-        #editor {
-            width: 100%; min-height: 400px; padding: 1rem;
-            font-size: 1rem; line-height: 1.6;
-            border: 2px solid #ddd; border-radius: 8px;
-            background: transparent; resize: vertical;
-            font-family: system-ui, sans-serif;
-            position: relative;
-            z-index: 1;
-        }
-        #editor:focus { outline: none; border-color: #007bff; }
-
-        .highlight-block {
-            background: #ffeb3b;
-            border-radius: 2px;
-        }
-
-        #status {
-            margin-top: 0.5rem; padding: 0.5rem;
-            font-size: 0.875rem; color: #666;
-        }
-        .connected { color: #28a745; }
-        .disconnected { color: #dc3545; }
-
-        #translating-status {
-            position: fixed; top: 1rem; right: 1rem;
-            padding: 0.75rem 1.5rem; border-radius: 4px;
-            background: #ff6b00; color: white;
-            font-weight: bold; display: none;
-            animation: pulse 1s ease-in-out infinite;
-        }
-        #translating-status.active { display: block; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Babbel Docs</title>
+  <link rel="stylesheet" href="/static/vendor/prosemirror.css">
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <header>
-        <h1>Babbel Docs</h1>
-        <div>
-            <span id="clients">0 users</span>
-            <select id="language">
-                <option value="en">English</option>
-                <option value="pl">Polski</option>
-                <option value="zh">中文</option>
-            </select>
-        </div>
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <h1>Babbel Docs</h1>
+      <button id="new-doc" title="New document">+</button>
+    </div>
+    <ul id="doc-list"></ul>
+    <div class="sidebar-foot">
+      <span id="conn-dot" class="dot"></span><span id="conn-text">Connecting…</span>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <input id="doc-title" placeholder="Untitled" autocomplete="off">
+      <div class="topbar-right">
+        <span id="presence" title="Connected users"></span>
+        <span id="translating" hidden>Translating…</span>
+        <select id="lang-select" title="Language"></select>
+        <button id="add-lang" title="Add a language">+ lang</button>
+        <button id="export-pdf" title="Export this language as PDF">PDF</button>
+      </div>
     </header>
 
-    <div class="editor-wrap">
-        <div id="highlight-layer"></div>
-        <textarea id="editor" placeholder="Start typing..."></textarea>
+    <div id="add-lang-panel" hidden>
+      <input id="add-lang-input" list="lang-catalog" placeholder="Language (e.g. Spanish or es)">
+      <datalist id="lang-catalog"></datalist>
+      <button id="add-lang-confirm">Add</button>
+      <button id="add-lang-cancel">Cancel</button>
     </div>
 
-    <div id="status" class="disconnected">Disconnected</div>
-    <div id="translating-status">Translating...</div>
+    <div id="toolbar">
+      <button data-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+      <button data-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+      <button data-cmd="underline" title="Underline (Ctrl+U)"><u>U</u></button>
+      <button data-cmd="strike" title="Strikethrough"><s>S</s></button>
+      <button data-cmd="code" title="Inline code">&lt;&gt;</button>
+      <button data-cmd="link" title="Link">🔗</button>
+      <span class="sep"></span>
+      <button data-cmd="paragraph" title="Paragraph">¶</button>
+      <button data-cmd="h1" title="Heading 1">H1</button>
+      <button data-cmd="h2" title="Heading 2">H2</button>
+      <button data-cmd="h3" title="Heading 3">H3</button>
+      <span class="sep"></span>
+      <button data-cmd="bullet" title="Bullet list">•≡</button>
+      <button data-cmd="ordered" title="Numbered list">1≡</button>
+      <button data-cmd="quote" title="Blockquote">❝</button>
+      <button data-cmd="codeblock" title="Code block">{ }</button>
+      <span class="sep"></span>
+      <button data-cmd="undo" title="Undo (Ctrl+Z)">↺</button>
+      <button data-cmd="redo" title="Redo (Ctrl+Y)">↻</button>
+    </div>
 
-    <script>
-        const editor = document.getElementById('editor');
-        const highlightLayer = document.getElementById('highlight-layer');
-        const langSelect = document.getElementById('language');
-        const statusEl = document.getElementById('status');
-        const clientsEl = document.getElementById('clients');
-        const translatingStatus = document.getElementById('translating-status');
+    <div id="editor-scroll"><div id="editor"></div></div>
 
-        let ws = null;
-        let currentLang = 'en';
-        let debounceTimer = null;
-        let lastSentText = '';
-        let receivingUpdate = false;
-        let translatingBlocks = [];  // Block indices being translated
+    <div id="empty-state" hidden>
+      <p>No document selected.</p>
+      <button id="empty-create">Create a document</button>
+    </div>
+  </main>
 
-        // Sentence enders (must match backend)
-        const SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f';
-
-        // Split text into blocks (content and separators)
-        const splitIntoBlocks = (text) => {
-            if (!text) return [];
-            const pattern = new RegExp(`([${SENTENCE_ENDERS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}]+\\s*|\\n+)`);
-            const parts = text.split(pattern).filter(p => p);
-
-            const blocks = [];
-            for (const part of parts) {
-                const isSep = new RegExp(`^[${SENTENCE_ENDERS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s\\n]+$`).test(part);
-                blocks.push({ type: isSep ? 'sep' : 'content', text: part });
-            }
-            return blocks;
-        };
-
-        // Markers for untranslated blocks (must match backend)
-        const PLACEHOLDER = '…';
-        const FALLBACK_MARKER = '⟨';
-
-        // Update highlight layer to show translating blocks
-        const updateHighlights = () => {
-            // Use original text with markers for detecting fallback blocks
-            const textWithMarkers = editor.dataset.originalText || editor.value;
-            const blocks = splitIntoBlocks(textWithMarkers);
-            let contentIdx = 0;
-            let html = '';
-            let hasHighlights = false;
-
-            for (const block of blocks) {
-                // Check if this is fallback text (source language shown while translating)
-                const isFallback = block.text.startsWith(FALLBACK_MARKER);
-                const displayText = isFallback ? block.text.slice(1) : block.text;
-
-                const escaped = displayText
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/\n/g, '<br>');
-
-                if (block.type === 'content') {
-                    const isPlaceholder = block.text === PLACEHOLDER;
-                    const shouldHighlight = translatingBlocks.includes(contentIdx) || isPlaceholder || isFallback;
-
-                    if (shouldHighlight) {
-                        hasHighlights = true;
-                        html += `<span class="highlight-block">${escaped}</span>`;
-                    } else {
-                        html += escaped;
-                    }
-                    contentIdx++;
-                } else {
-                    html += escaped;
-                }
-            }
-
-            highlightLayer.innerHTML = hasHighlights ? html : '';
-        };
-
-        const connect = () => {
-            ws = new WebSocket(`ws://${location.host}/ws`);
-
-            ws.onopen = () => {
-                statusEl.textContent = 'Connected';
-                statusEl.className = 'connected';
-                ws.send(JSON.stringify({ type: 'load', lang: currentLang }));
-            };
-
-            ws.onclose = () => {
-                statusEl.textContent = 'Disconnected - reconnecting...';
-                statusEl.className = 'disconnected';
-                setTimeout(connect, 2000);
-            };
-
-            ws.onmessage = (e) => {
-                const msg = JSON.parse(e.data);
-                console.log('Received:', msg.type);
-
-                if (msg.type === 'doc') {
-                    clearTimeout(debounceTimer);
-                    receivingUpdate = true;
-                    // Strip markers for display but keep original for highlight detection
-                    const displayText = msg.text.replace(new RegExp(FALLBACK_MARKER, 'g'), '');
-                    editor.value = displayText;
-                    lastSentText = displayText;
-                    // Store original text with markers for highlighting
-                    editor.dataset.originalText = msg.text;
-                    receivingUpdate = false;
-                    updateHighlights();
-                }
-
-                if (msg.type === 'clients') {
-                    clientsEl.textContent = `${msg.count} user${msg.count !== 1 ? 's' : ''}`;
-                }
-
-                if (msg.type === 'translating') {
-                    translatingBlocks = msg.blocks || [];
-                    console.log('Translating blocks:', translatingBlocks);
-                    if (translatingBlocks.length > 0) {
-                        translatingStatus.classList.add('active');
-                    } else {
-                        translatingStatus.classList.remove('active');
-                    }
-                    updateHighlights();
-                }
-            };
-        };
-
-        // Send update when user stops typing (100ms debounce for all changes)
-        editor.addEventListener('input', () => {
-            if (receivingUpdate) return;
-
-            // Clear stored original text since user is now editing
-            delete editor.dataset.originalText;
-
-            clearTimeout(debounceTimer);
-            const text = editor.value.replace(new RegExp(PLACEHOLDER, 'g'), '');
-
-            debounceTimer = setTimeout(() => {
-                if (text !== lastSentText && ws?.readyState === WebSocket.OPEN) {
-                    console.log('Sending update');
-                    ws.send(JSON.stringify({
-                        type: 'update',
-                        lang: currentLang,
-                        text: text
-                    }));
-                    lastSentText = text;
-                }
-            }, 100);
-        });
-
-        // Sync scroll
-        editor.addEventListener('scroll', () => {
-            highlightLayer.scrollTop = editor.scrollTop;
-        });
-
-        // Language switching
-        langSelect.addEventListener('change', () => {
-            currentLang = langSelect.value;
-            translatingBlocks = [];
-            updateHighlights();
-            if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'load', lang: currentLang }));
-            }
-        });
-
-        connect();
-    </script>
+  <div id="toast" hidden></div>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>
