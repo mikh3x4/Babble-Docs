@@ -216,13 +216,7 @@
             };
         };
 
-        // Check if change is structure-only (just separators/whitespace)
-        const isStructureOnlyChange = (oldText, newText) => {
-            const getContent = (t) => t.replace(new RegExp(`[${SENTENCE_ENDERS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s\\n]+`, 'g'), '');
-            return getContent(oldText) === getContent(newText);
-        };
-
-        // Send update when user stops typing
+        // Send update when user stops typing (100ms debounce for all changes)
         editor.addEventListener('input', () => {
             if (receivingUpdate) return;
 
@@ -231,9 +225,6 @@
 
             clearTimeout(debounceTimer);
             const text = editor.value.replace(new RegExp(PLACEHOLDER, 'g'), '');
-
-            // Use shorter debounce for structure-only changes (100ms vs 500ms)
-            const delay = isStructureOnlyChange(lastSentText, text) ? 100 : 500;
 
             debounceTimer = setTimeout(() => {
                 if (text !== lastSentText && ws?.readyState === WebSocket.OPEN) {
@@ -245,7 +236,7 @@
                     }));
                     lastSentText = text;
                 }
-            }, delay);
+            }, 100);
         });
 
         // Sync scroll

@@ -31,16 +31,16 @@ DOCS_DIR.mkdir(exist_ok=True)
 
 SENTENCE_ENDERS = '.!?\u3002\uff01\uff1f'
 LANGUAGES = {"en": "English", "pl": "Polish", "zh": "Mandarin Chinese"}
-TRANSLATION_DELAY = 2.0  # seconds to wait before starting translation
+TRANSLATION_DELAY = 0.5  # seconds to wait before starting translation
 PLACEHOLDER = '…'  # Used for completely empty blocks
 FALLBACK_MARKER = '⟨'  # Prefix for fallback text (source language shown while translating)
 
 clients: dict[WebSocket, str] = {}
 DOC_PATH = DOCS_DIR / "document.json"
 
-# Translation task management
-pending_translation_task: asyncio.Task | None = None
-translation_cancelled = False
+# Per-block translation task management
+# Maps block content (source text) -> asyncio.Task for that block's translation
+pending_translations: dict[str, asyncio.Task] = {}
 
 def load_doc() -> list:
     if DOC_PATH.exists():
@@ -206,33 +206,33 @@ async def send_doc_to_all(doc: list, exclude: WebSocket = None):
 
 # --- Delayed Translation ---
 
-async def do_translation(source_lang: str, changed_indices: list, exclude_ws: WebSocket):
-    """Perform translation after delay. Can be cancelled if new edits come in."""
-    global translation_cancelled
+async def do_single_block_translation(block_content: str, block_idx: int, source_lang: str, exclude_ws: WebSocket):
+    """Translate a single block after delay. Can be cancelled if block is edited again."""
     exclude_lang = clients.get(exclude_ws, "?")
-    logger.info(f"Translation task started: blocks {changed_indices} from {source_lang} (exclude {exclude_lang} client)")
+    logger.info(f"Translation task started for block {block_idx}: '{block_content[:30]}' from {source_lang}")
 
     try:
         # Wait before starting translation
-        logger.info(f"Waiting {TRANSLATION_DELAY}s before translating blocks {changed_indices}")
+        logger.info(f"Waiting {TRANSLATION_DELAY}s before translating block {block_idx}")
         await asyncio.sleep(TRANSLATION_DELAY)
 
-        if translation_cancelled:
-            logger.info("Translation cancelled during delay")
-            return
-
-        # Highlight already sent immediately in websocket handler
-        logger.info(f"Starting translation for blocks {changed_indices}")
-
-        # Load current doc state
+        # Load current doc state and find the block by content
         doc = load_doc()
         contents = get_content_blocks(doc)
 
+        # Find the block by content (it may have moved)
+        actual_idx = None
+        for i, block in enumerate(contents):
+            if block.get(source_lang) == block_content:
+                actual_idx = i
+                break
+
+        if actual_idx is None:
+            logger.info(f"Block '{block_content[:30]}' no longer exists, skipping translation")
+            return
+
         def get_context(idx: int, lang: str, direction: int) -> str:
-            """
-            Get context in given direction (-1 for before, +1 for after).
-            If adjacent block is short (<10 chars), include one more block for context.
-            """
+            """Get context in given direction (-1 for before, +1 for after)."""
             parts = []
             i = idx + direction
             while 0 <= i < len(contents) and len(parts) < 2:
@@ -241,103 +241,98 @@ async def do_translation(source_lang: str, changed_indices: list, exclude_ws: We
                     parts.insert(0, text)
                 else:
                     parts.append(text)
-                # If this block is short, get one more for context
                 if len(text) >= 10 or len(parts) >= 2:
                     break
                 i += direction
             return " ".join(parts) if parts else ""
 
-        # Build list of all translation tasks
-        async def translate_one(idx: int, target_lang: str):
-            """Translate a single block to a single language."""
-            if idx >= len(contents):
-                return None
+        async def translate_to_lang(target_lang: str):
+            """Translate block to a single target language."""
+            context_before = get_context(actual_idx, source_lang, -1)
+            context_after = get_context(actual_idx, source_lang, +1)
+            target_before = get_context(actual_idx, target_lang, -1)
+            target_after = get_context(actual_idx, target_lang, +1)
+            existing = contents[actual_idx].get(target_lang, "")
 
-            source_text = contents[idx].get(source_lang, "")
-            if not source_text:
-                return None
-
-            # Get extended context if adjacent blocks are short
-            context_before = get_context(idx, source_lang, -1)
-            context_after = get_context(idx, source_lang, +1)
-            target_before = get_context(idx, target_lang, -1)
-            target_after = get_context(idx, target_lang, +1)
-            existing = contents[idx].get(target_lang, "")
-
-            logger.info(f"Translating block {idx}: {source_lang}->{target_lang} (context: '{context_before[:20]}' | '{context_after[:20]}')")
+            logger.info(f"Translating block {actual_idx}: {source_lang}->{target_lang}")
             translated = await asyncio.get_event_loop().run_in_executor(
                 None,
                 translate_block,
-                source_text, context_before, context_after,
+                block_content, context_before, context_after,
                 target_before, target_after, existing,
                 source_lang, target_lang
             )
-            return (idx, target_lang, translated)
+            return (target_lang, translated)
 
-        # Create all translation tasks
-        tasks = []
-        for idx in changed_indices:
-            for target_lang in LANGUAGES:
-                if target_lang != source_lang:
-                    tasks.append(translate_one(idx, target_lang))
-
-        logger.info(f"Running {len(tasks)} translations in parallel")
-
-        # Run all translations in parallel
+        # Translate to all other languages in parallel
+        tasks = [translate_to_lang(lang) for lang in LANGUAGES if lang != source_lang]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        if translation_cancelled:
-            logger.info("Translation cancelled, discarding results")
-        else:
-            # Apply results
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"Translation error: {result}")
-                elif result:
-                    idx, target_lang, translated = result
-                    contents[idx][target_lang] = translated
+        # Re-load doc and find block again (may have changed during translation)
+        doc = load_doc()
+        contents = get_content_blocks(doc)
+        actual_idx = None
+        for i, block in enumerate(contents):
+            if block.get(source_lang) == block_content:
+                actual_idx = i
+                break
 
-            logger.info(f"Translation complete, saving doc")
-            save_doc(doc)
+        if actual_idx is None:
+            logger.info(f"Block '{block_content[:30]}' removed during translation, discarding")
+            return
 
-            # Clear translating state BEFORE sending doc update
-            for ws, ws_lang in list(clients.items()):
-                if ws_lang != source_lang:
-                    try:
-                        await ws.send_json({"type": "translating", "blocks": []})
-                    except:
-                        clients.pop(ws, None)
-            logger.info(f"Cleared translating state for non-{source_lang} clients")
+        # Apply results
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Translation error: {result}")
+            elif result:
+                target_lang, translated = result
+                contents[actual_idx][target_lang] = translated
 
-            # Now send the updated doc
-            await send_doc_to_all(doc, exclude=exclude_ws)
+        logger.info(f"Block translation complete, saving doc")
+        save_doc(doc)
+
+        # Send updated doc to affected clients
+        await send_doc_to_all(doc, exclude=exclude_ws)
+
+        # Update translating highlights (remove this block from pending)
+        await broadcast_translating_status(source_lang)
 
     except asyncio.CancelledError:
-        logger.info("Translation task cancelled")
-        # Don't clear highlights - new task will send its own, or edit handler already did
+        logger.info(f"Translation cancelled for block '{block_content[:30]}'")
     except Exception as e:
-        logger.error(f"Translation error: {e}")
-        for ws in list(clients.keys()):
+        logger.error(f"Translation error for block: {e}")
+    finally:
+        # Clean up from pending_translations
+        pending_translations.pop(block_content, None)
+
+async def broadcast_translating_status(source_lang: str):
+    """Broadcast current translating blocks to non-source-lang clients."""
+    # Get all blocks currently being translated
+    translating_contents = set(pending_translations.keys())
+
+    # Find indices of these blocks in current doc
+    doc = load_doc()
+    contents = get_content_blocks(doc)
+    translating_indices = []
+    for i, block in enumerate(contents):
+        for lang in LANGUAGES:
+            if block.get(lang) in translating_contents:
+                translating_indices.append(i)
+                break
+
+    for ws, ws_lang in list(clients.items()):
+        if ws_lang != source_lang:
             try:
-                await ws.send_json({"type": "translating", "blocks": []})
+                await ws.send_json({"type": "translating", "blocks": translating_indices})
             except:
                 clients.pop(ws, None)
-
-def cancel_pending_translation():
-    """Cancel any pending translation task."""
-    global pending_translation_task, translation_cancelled
-    if pending_translation_task and not pending_translation_task.done():
-        translation_cancelled = True
-        pending_translation_task.cancel()
-        logger.info("Cancelled pending translation")
-    translation_cancelled = False
+    logger.info(f"Broadcast translating status: {translating_indices}")
 
 # --- WebSocket Handler ---
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    global pending_translation_task, translation_cancelled
-
     await ws.accept()
     clients[ws] = "en"
     logger.info(f"Client connected. Total: {len(clients)}")
@@ -363,46 +358,44 @@ async def websocket_endpoint(ws: WebSocket):
                 old_doc = load_doc()
                 new_doc = text_to_doc(new_text, source_lang, old_doc)
 
-                old_contents = get_content_blocks(old_doc)
                 new_contents = get_content_blocks(new_doc)
-                logger.info(f"Blocks: {len(old_contents)} -> {len(new_contents)}")
+                logger.info(f"Blocks: {len(get_content_blocks(old_doc))} -> {len(new_contents)}")
 
                 # Find blocks that need translation (missing any target language)
-                # Content matching in text_to_doc already preserved translations for unchanged blocks
-                changed_indices = []
+                blocks_needing_translation = []
                 for i, block in enumerate(new_contents):
-                    block_text = block.get(source_lang, "")[:30]
+                    block_text = block.get(source_lang, "")
                     for lang in LANGUAGES:
                         if lang != source_lang and lang not in block:
-                            changed_indices.append(i)
-                            logger.info(f"Block {i} needs translation (missing {lang}): '{block_text}'")
+                            blocks_needing_translation.append((i, block_text))
+                            logger.info(f"Block {i} needs translation (missing {lang}): '{block_text[:30]}'")
                             break
 
                 # Broadcast immediately, save async
                 await send_doc_to_all(new_doc, exclude=ws)
-                save_doc(new_doc)  # TODO: make truly async if needed
+                save_doc(new_doc)
 
-                if not changed_indices:
-                    logger.info("No content changes")
+                if not blocks_needing_translation:
+                    logger.info("No content changes needing translation")
                     continue
 
-                # Send translating highlight IMMEDIATELY (don't wait for 2s delay)
-                for ws_client, ws_lang in list(clients.items()):
-                    if ws_lang != source_lang:
-                        try:
-                            await ws_client.send_json({"type": "translating", "blocks": changed_indices})
-                        except:
-                            clients.pop(ws_client, None)
-                logger.info(f"Sent immediate translating highlight for blocks: {changed_indices}")
+                # For each block needing translation, check if we already have a pending task
+                for idx, block_content in blocks_needing_translation:
+                    if block_content in pending_translations:
+                        # Same block edited again - cancel old task and start new one
+                        old_task = pending_translations[block_content]
+                        if not old_task.done():
+                            old_task.cancel()
+                            logger.info(f"Cancelled pending translation for block '{block_content[:30]}'")
 
-                # Cancel any pending translation and start new one
-                cancel_pending_translation()
-                translation_cancelled = False
+                    # Start new translation task for this block
+                    pending_translations[block_content] = asyncio.create_task(
+                        do_single_block_translation(block_content, idx, source_lang, ws)
+                    )
+                    logger.info(f"Scheduled translation for block {idx}: '{block_content[:30]}'")
 
-                logger.info(f"Scheduling translation for {len(changed_indices)} blocks: {changed_indices}")
-                pending_translation_task = asyncio.create_task(
-                    do_translation(source_lang, changed_indices, ws)
-                )
+                # Broadcast translating status with all pending block indices
+                await broadcast_translating_status(source_lang)
 
     except WebSocketDisconnect:
         clients.pop(ws, None)
