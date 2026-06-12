@@ -1,68 +1,78 @@
 # Babbel Docs
 
-A collaborative rich-text editor with real-time translation. Multiple users can
-edit the same document in different languages; edited blocks are automatically
+A collaborative rich-text editor with real-time translation. Everyone edits
+the same document in their own language; edited sentences are automatically
 retranslated into the document's other languages with Claude.
+
+| English view | Same document in Chinese |
+|---|---|
+| ![Editor, English](screenshots/editor-en.png) | ![Editor, Chinese](screenshots/editor-zh.png) |
 
 ## Features
 
-- **Rich text**: bold/italic/underline/strikethrough, headings, bullet and
-  numbered lists, blockquotes, code blocks, links (ProseMirror editor).
-- **Multiple documents**: sidebar to create, rename, switch, and delete docs.
-- **Per-document languages**: starts with English/Polish/Mandarin; add any
-  language from the catalog (or a custom code/name) per document.
-- **Real-time sync**: WebSockets; blocks being translated are highlighted.
-- **PDF export**: server-rendered PDF of the language you're viewing
-  (WeasyPrint; CJK supported via Noto fonts).
-
-## Setup
-
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# WeasyPrint needs Pango (usually present); Chinese PDF output needs CJK fonts:
-sudo apt-get install fonts-noto-cjk
-
-cp .env.example .env   # add your Anthropic API key
-```
-
-Optional env vars: `TRANSLATION_MODEL` (default `claude-sonnet-4-6`).
+- **Rich text** (ProseMirror): bold / italic / underline / strikethrough,
+  inline code, links, H1–H3, nested bullet & numbered lists, blockquotes,
+  code blocks. Markdown shortcuts while typing (`# `, `- `, `> `, ``` ``` ```).
+- **Sentence-level translation**: only the sentences you actually edited are
+  retranslated — the surrounding paragraph, its current translation, and the
+  neighboring blocks ride along as context. Formatting survives translation.
+- **Multiple documents**: sidebar to create, rename, switch, delete.
+- **Per-document languages**: starts with English / Polish / Mandarin; add any
+  language (catalog or custom) and existing content is translated into it.
+- **Markdown in & out**: "Copy MD" puts the whole document on the clipboard as
+  Markdown; "Paste MD" inserts clipboard Markdown at the cursor.
+- **PDF export** of whichever language you're viewing (WeasyPrint, CJK-ready).
+- **Cost counter**: live per-document Claude spend in the top bar (hover for
+  calls / token counts).
+- **Real-time presence** and yellow highlights on blocks awaiting translation.
 
 ## Run
 
 ```bash
-python main.py
+./run.sh
 ```
 
-Open http://localhost:8000. Open multiple tabs with different languages to see
-real-time translation.
+That creates the venv, installs dependencies, scaffolds `.env` (add your
+`ANTHROPIC_API_KEY`), and starts the server on http://localhost:8000.
+Open multiple tabs with different languages to see live translation.
+
+For Chinese PDF output install CJK fonts once: `sudo apt-get install fonts-noto-cjk`.
+
+Optional env vars: `TRANSLATION_MODEL` (default `claude-sonnet-4-6`).
+
+## Keyboard shortcuts
+
+| Keys | Action |
+|---|---|
+| Ctrl+B / Ctrl+I / Ctrl+U | Bold / italic / underline |
+| Tab / Shift+Tab (in a list) | Indent / outdent list item |
+| Ctrl+] / Ctrl+[ | Same, where Tab is awkward |
+| Enter (in a list) | New list item |
+| Ctrl+Z / Ctrl+Y | Undo / redo |
+| `# `, `## `, `- `, `1. `, `> `, ``` ``` ``` | Heading / list / quote / code block as you type |
 
 ## How it works
 
 A document is a flat list of blocks (`paragraph | heading | list_item |
 blockquote | code`), each with a stable id and per-language inline-HTML
-content. Clients send the block list in their editing language; the server
-merges by block id, so unchanged blocks keep their translations. Changed
-blocks become the new source text and are retranslated (debounced, per block,
-cancel-on-reedit) into the document's other languages by Claude. Code blocks
-and empty blocks are shared verbatim across languages. Until a translation
-arrives, other-language clients see the source text highlighted.
+content. Clients send their language's block list over a WebSocket; the server
+merges by block id, so unchanged, reordered, restyled, or re-indented blocks
+keep their translations. For an edited block the server diffs its sentences
+against the source text the existing translations were made from: unchanged
+sentences keep their translation, edited ones are retranslated (debounced,
+cancel-on-reedit). Code blocks and empty blocks are shared verbatim. Until a
+translation arrives, other-language readers see the source text highlighted.
+
+Conflicts resolve last-write-wins per block; the most recent writer's language
+becomes that block's source language.
 
 ## Files
 
-- `main.py` — FastAPI backend: REST (docs/languages/PDF), per-document
-  WebSocket rooms, block merge, translation pipeline.
-- `static/app.js` — frontend: ProseMirror editor, sidebar, toolbar, WS sync.
-- `static/index.html`, `static/style.css` — shell and styles.
-- `static/vendor/prosemirror.js` — committed ProseMirror bundle (rebuild with
-  esbuild if upgrading; no runtime CDN dependency).
-- `docs/` — document storage, one JSON file per document.
-- `tests/` — `pytest tests/ -v`.
-
-## Conflict model
-
-Last write wins at block granularity. Edits to *different* blocks from
-different languages merge cleanly; concurrent edits to the same block resolve
-to the most recent write, which becomes that block's source language.
+- `main.py` — FastAPI backend: REST (docs / languages / PDF), per-document
+  WebSocket rooms, block merge, sentence-diff translation pipeline.
+- `static/app.js` — frontend: ProseMirror editor, sidebar, toolbar, WS sync,
+  markdown conversion.
+- `static/vendor/prosemirror.js` — committed ProseMirror bundle (esbuild;
+  no runtime CDN dependency).
+- `docs/` — document storage, one JSON file per document (gitignored).
+- `tests/` — `pytest tests/ -q`.
