@@ -28,7 +28,7 @@ sudo apt-get install fonts-noto-cjk
 cp .env.example .env   # add your Anthropic API key
 ```
 
-Optional env vars: `TRANSLATION_MODEL` (default `claude-opus-4-8`).
+Optional env vars: `TRANSLATION_MODEL` (default `claude-sonnet-4-6`).
 
 ## Run
 

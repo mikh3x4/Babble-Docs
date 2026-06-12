@@ -38,7 +38,7 @@ for noisy in ("httpx", "httpcore", "watchfiles", "fontTools", "weasyprint"):
 DOCS_DIR = Path("docs")
 DOCS_DIR.mkdir(exist_ok=True)
 
-TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-opus-4-8")
+TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-sonnet-4-6")
 TRANSLATION_DEBOUNCE = 1.0  # seconds after the last edit before translating a block
 
 # USD per million tokens (input, output), for the cost counter.
