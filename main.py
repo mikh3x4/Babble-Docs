@@ -41,6 +41,26 @@ DOCS_DIR.mkdir(exist_ok=True)
 TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-opus-4-8")
 TRANSLATION_DEBOUNCE = 1.0  # seconds after the last edit before translating a block
 
+# USD per million tokens (input, output), for the cost counter.
+PRICING_PER_MTOK = {
+    "claude-fable-5": (10.0, 50.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+
+
+def add_usage(doc: dict, input_tokens: int, output_tokens: int, calls: int):
+    usage = doc.setdefault("usage", {"input_tokens": 0, "output_tokens": 0,
+                                     "calls": 0, "cost_usd": 0.0})
+    pin, pout = PRICING_PER_MTOK.get(TRANSLATION_MODEL, (5.0, 25.0))
+    usage["input_tokens"] += input_tokens
+    usage["output_tokens"] += output_tokens
+    usage["calls"] += calls
+    usage["cost_usd"] += (input_tokens * pin + output_tokens * pout) / 1e6
+
 # Common languages offered in the UI; any {code, name} pair is accepted.
 LANGUAGE_CATALOG = {
     "en": "English", "pl": "Polish", "zh": "Mandarin Chinese", "es": "Spanish",
@@ -343,18 +363,26 @@ class TranslationManager:
             targets = list(block["pending"])
             lang_names = {l["code"]: l["name"] for l in doc["languages"]}
             context = self._context(doc, block_id, source)
+            spent = {"input": 0, "output": 0, "calls": 0}
 
             results = await asyncio.gather(
                 *(self._translate_block(source_html, prev_html, block["content"].get(t),
-                                        lang_names[source], lang_names[t], context)
+                                        lang_names[source], lang_names[t], context, spent)
                   for t in targets),
                 return_exceptions=True,
             )
 
-            # Re-check state: the block may have been edited or deleted meanwhile.
+            # Record cost even if the result ends up discarded below.
             doc = store.docs.get(doc_id)
-            block = next((b for b in doc["blocks"] if b["id"] == block_id), None) if doc else None
+            if not doc:
+                return
+            add_usage(doc, spent["input"], spent["output"], spent["calls"])
+
+            # Re-check state: the block may have been edited or deleted meanwhile.
+            block = next((b for b in doc["blocks"] if b["id"] == block_id), None)
             if not block or block["content"].get(source) != source_html:
+                store.save(doc)
+                await rooms.broadcast_usage(doc)
                 return
             errors = []
             for target, result in zip(targets, results):
@@ -368,6 +396,7 @@ class TranslationManager:
                 block.pop("prev_html", None)
             store.save(doc)
             await rooms.broadcast_doc(doc)
+            await rooms.broadcast_usage(doc)
             if errors:
                 logger.error(f"Translation errors for block {block_id}: {errors}")
                 await rooms.broadcast_json(doc_id, {
@@ -388,7 +417,7 @@ class TranslationManager:
 
     async def _translate_block(self, source_html: str, prev_html: str | None,
                                existing: str | None, source_name: str,
-                               target_name: str, context: dict) -> str:
+                               target_name: str, context: dict, spent: dict) -> str:
         """Translate a block sentence by sentence, reusing unchanged sentences.
 
         When the existing translation aligns with the previous source text,
@@ -407,7 +436,7 @@ class TranslationManager:
 
         translated = await asyncio.gather(
             *(self._translate_sentence(s, source_html, existing, source_name,
-                                       target_name, context) for s in todo))
+                                       target_name, context, spent) for s in todo))
         results = iter(translated)
         parts = []
         for op, s in ops:
@@ -420,7 +449,7 @@ class TranslationManager:
 
     async def _translate_sentence(self, sentence: str, source_paragraph: str,
                                   target_paragraph: str | None, source_name: str,
-                                  target_name: str, context: dict) -> str:
+                                  target_name: str, context: dict, spent: dict) -> str:
         prompt = f"""Translate ONE SENTENCE from {source_name} to {target_name}.
 
 The sentence is inline HTML from a rich-text document. Preserve the HTML tags
@@ -440,6 +469,9 @@ Reply with ONLY the translated sentence as inline HTML — no quotes, no explana
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
+        spent["input"] += response.usage.input_tokens
+        spent["output"] += response.usage.output_tokens
+        spent["calls"] += 1
         if response.stop_reason == "refusal":
             raise RuntimeError("translation request was refused")
         text = "".join(b.text for b in response.content if b.type == "text").strip()
@@ -497,6 +529,10 @@ class Rooms:
             "type": "meta", "title": doc["title"], "languages": doc["languages"],
         })
 
+    async def broadcast_usage(self, doc: dict):
+        if doc.get("usage"):
+            await self.broadcast_json(doc["id"], {"type": "usage", "usage": doc["usage"]})
+
 
 rooms = Rooms()
 
@@ -513,7 +549,7 @@ async def websocket_endpoint(ws: WebSocket, doc_id: str):
         doc = store.docs[doc_id]
         await ws.send_json({
             "type": "init", "title": doc["title"], "languages": doc["languages"],
-            "blocks": render_blocks(doc, lang),
+            "blocks": render_blocks(doc, lang), "usage": doc.get("usage"),
         })
         await rooms.broadcast_presence(doc_id)
 

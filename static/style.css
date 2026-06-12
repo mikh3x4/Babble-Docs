@@ -54,6 +54,10 @@ body {
 #doc-title:focus { outline: 2px solid #bfdbfe; background: #fff; }
 .topbar-right { display: flex; align-items: center; gap: 8px; }
 #presence { font-size: 12.5px; color: #6b7280; white-space: nowrap; }
+#cost {
+  font-size: 12.5px; color: #047857; background: #ecfdf5;
+  padding: 3px 9px; border-radius: 999px; white-space: nowrap; cursor: default;
+}
 #translating {
   font-size: 12.5px; color: #b45309; background: #fef3c7;
   padding: 3px 9px; border-radius: 999px; animation: pulse 1.2s ease-in-out infinite;

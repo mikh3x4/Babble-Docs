@@ -216,7 +216,7 @@ function buildKeymap() {
 const $ = (id) => document.getElementById(id);
 const els = {
   docList: $("doc-list"), newDoc: $("new-doc"), title: $("doc-title"),
-  presence: $("presence"), translating: $("translating"),
+  presence: $("presence"), translating: $("translating"), cost: $("cost"),
   langSelect: $("lang-select"), addLang: $("add-lang"),
   addLangPanel: $("add-lang-panel"), addLangInput: $("add-lang-input"),
   addLangConfirm: $("add-lang-confirm"), addLangCancel: $("add-lang-cancel"),
@@ -237,6 +237,15 @@ let applyingRemote = false;
 let skippedRemote = false;
 let reconnectTimer = null;
 let catalog = [];
+
+function updateCost(usage) {
+  if (!usage) { els.cost.hidden = true; return; }
+  els.cost.hidden = false;
+  els.cost.textContent = `$${usage.cost_usd.toFixed(4)}`;
+  els.cost.title = `Claude translation cost for this document\n` +
+    `${usage.calls} API calls · ${usage.input_tokens.toLocaleString()} input / ` +
+    `${usage.output_tokens.toLocaleString()} output tokens`;
+}
 
 function toast(message, isError = false) {
   els.toast.textContent = message;
@@ -453,6 +462,7 @@ function connect(docId) {
       els.title.value = msg.title;
       renderLangSelect();
       lastReceived = new Map();
+      updateCost(msg.usage);
       applyRemote(msg.blocks);
       // renderLangSelect may have fallen back if the remembered language
       // isn't one of this document's languages.
@@ -468,6 +478,8 @@ function connect(docId) {
       const parts = Object.entries(msg.users).map(([code, n]) => `${n} ${code}`);
       const total = Object.values(msg.users).reduce((a, b) => a + b, 0);
       els.presence.textContent = total > 1 ? `${total} online (${parts.join(", ")})` : "";
+    } else if (msg.type === "usage") {
+      updateCost(msg.usage);
     } else if (msg.type === "error") {
       toast(msg.message, true);
     } else if (msg.type === "deleted") {
@@ -527,6 +539,7 @@ function openDoc(docId) {
   if (currentDoc?.id === docId) return;
   clearTimeout(sendTimer); sendTimer = null;
   currentDoc = { id: docId };
+  updateCost(null);
   localStorage.setItem("babbel-doc", docId);
   els.emptyState.hidden = true;
   els.editorScroll.hidden = false;
