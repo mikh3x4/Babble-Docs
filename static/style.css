@@ -88,6 +88,7 @@ body {
 #toolbar button:hover { background: #eef1f4; }
 #toolbar button.active { background: #dbeafe; color: #1d4ed8; }
 #toolbar .sep { width: 1px; height: 18px; background: #e4e7eb; margin: 0 6px; }
+#toolbar button.wide { padding: 0 8px; }
 
 /* --- Editor --- */
 #editor-scroll { flex: 1; overflow-y: auto; padding: 28px 0 60px; }

@@ -8,7 +8,8 @@
 import {
   EditorState, Plugin, PluginKey, TextSelection,
   EditorView, Decoration, DecorationSet,
-  Schema, DOMParser as PMDOMParser, DOMSerializer,
+  Schema, DOMParser as PMDOMParser, DOMSerializer, Slice,
+  MarkdownSerializer, MarkdownParser, defaultMarkdownSerializer, defaultMarkdownParser, markdownit,
   basicSchema, addListNodes, splitListItem, liftListItem, sinkListItem, wrapInList as pmWrapInList,
   keymap, baseKeymap, toggleMark, setBlockType, wrapIn, lift, chainCommands, exitCode,
   history, undo, redo,
@@ -41,6 +42,23 @@ const marks = basicSchema.spec.marks
 const schema = new Schema({ nodes, marks });
 const serializer = DOMSerializer.fromSchema(schema);
 const pmParser = PMDOMParser.fromSchema(schema);
+
+// --- Markdown conversion ------------------------------------------------------
+
+const mdSerializer = new MarkdownSerializer(
+  { ...defaultMarkdownSerializer.nodes },
+  {
+    ...defaultMarkdownSerializer.marks,
+    underline: { open: "<u>", close: "</u>", mixable: true, expelEnclosingWhitespace: true },
+    strikethrough: { open: "~~", close: "~~", mixable: true, expelEnclosingWhitespace: true },
+  },
+);
+
+// Default tokens minus nodes our schema doesn't have, plus ~~strikethrough~~.
+const mdTokens = { ...defaultMarkdownParser.tokens, s: { mark: "strikethrough" } };
+delete mdTokens.hr;
+delete mdTokens.image;
+const mdParser = new MarkdownParser(schema, markdownit({ html: false }).disable(["hr", "image"]), mdTokens);
 
 const newId = () => crypto.getRandomValues(new Uint32Array(2)).reduce((s, n) => s + n.toString(16).padStart(8, "0"), "");
 const escapeHtml = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -463,7 +481,47 @@ const commands = {
   codeblock: () => setBlockType(schema.nodes.code_block, keepId({}))(view.state, view.dispatch),
   undo: () => undo(view.state, view.dispatch),
   redo: () => redo(view.state, view.dispatch),
+  copymd: copyMarkdown,
+  pastemd: pasteMarkdown,
 };
+
+async function copyMarkdown() {
+  const md = mdSerializer.serialize(view.state.doc);
+  try {
+    await navigator.clipboard.writeText(md);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = md;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+  toast("Copied document as Markdown");
+}
+
+function insertMarkdown(text) {
+  const parsed = mdParser.parse(text);
+  view.dispatch(view.state.tr
+    .replaceSelection(new Slice(parsed.content, 0, 0))
+    .scrollIntoView());
+}
+
+async function pasteMarkdown() {
+  let text;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch {
+    toast("Clipboard read was blocked by the browser — allow clipboard access and retry", true);
+    return;
+  }
+  if (!text?.trim()) { toast("Clipboard is empty", true); return; }
+  try {
+    insertMarkdown(text);
+  } catch (err) {
+    toast(`Couldn't parse clipboard as Markdown: ${err.message}`, true);
+  }
+}
 
 function updateToolbar() {
   if (!view) return;
@@ -701,6 +759,9 @@ els.exportPdf.onclick = () => {
   flushPendingSend();
   window.open(`/api/docs/${currentDoc.id}/export.pdf?lang=${encodeURIComponent(lang)}`, "_blank");
 };
+
+// Console/debug access to the markdown converters.
+window.babbel = { toMarkdown: () => mdSerializer.serialize(view.state.doc), insertMarkdown };
 
 // --- Boot --------------------------------------------------------------------------------
 
