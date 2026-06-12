@@ -9,7 +9,7 @@ import {
   EditorState, Plugin, PluginKey, TextSelection,
   EditorView, Decoration, DecorationSet,
   Schema, DOMParser as PMDOMParser, DOMSerializer,
-  basicSchema, addListNodes, splitListItem, liftListItem, wrapInList as pmWrapInList,
+  basicSchema, addListNodes, splitListItem, liftListItem, sinkListItem, wrapInList as pmWrapInList,
   keymap, baseKeymap, toggleMark, setBlockType, wrapIn, lift, chainCommands, exitCode,
   history, undo, redo,
   inputRules, wrappingInputRule, textblockTypeInputRule, undoInputRule,
@@ -20,7 +20,8 @@ import {
 
 const withId = (spec) => ({ ...spec, attrs: { ...(spec.attrs || {}), id: { default: null } } });
 
-let nodes = addListNodes(basicSchema.spec.nodes, "paragraph", "block");
+// A list item is one paragraph optionally followed by nested lists.
+let nodes = addListNodes(basicSchema.spec.nodes, "paragraph (bullet_list | ordered_list)*", "block");
 nodes = nodes.remove("image").remove("horizontal_rule");
 nodes = nodes.update("blockquote", { ...nodes.get("blockquote"), content: "paragraph+" });
 for (const name of ["paragraph", "heading", "code_block", "list_item"]) {
@@ -60,6 +61,22 @@ function parseInline(html) {
 
 function docToBlocks(doc) {
   const out = [];
+  const pushList = (listNode, indent) => {
+    const kind = listNode.type.name === "ordered_list" ? "ordered" : "bullet";
+    listNode.forEach((item) => {
+      let para = null;
+      const sublists = [];
+      item.forEach((child) => {
+        if (child.type.name === "paragraph" && !para) para = child;
+        else if (child.type.name === "bullet_list" || child.type.name === "ordered_list") sublists.push(child);
+      });
+      out.push({
+        id: item.attrs.id, type: "list_item", attrs: { list: kind, indent },
+        html: para ? inlineHTML(para) : "",
+      });
+      for (const sub of sublists) pushList(sub, indent + 1);
+    });
+  };
   doc.forEach((node) => {
     const t = node.type.name;
     if (t === "paragraph") {
@@ -71,44 +88,70 @@ function docToBlocks(doc) {
     } else if (t === "blockquote") {
       node.forEach((p) => out.push({ id: p.attrs.id, type: "blockquote", attrs: {}, html: inlineHTML(p) }));
     } else if (t === "bullet_list" || t === "ordered_list") {
-      const kind = t === "ordered_list" ? "ordered" : "bullet";
-      node.forEach((item) => out.push({
-        id: item.attrs.id, type: "list_item", attrs: { list: kind },
-        html: item.firstChild ? inlineHTML(item.firstChild) : "",
-      }));
+      pushList(node, 0);
     }
   });
   return out;
 }
 
+// Rebuild nested list nodes from a run of consecutive list_item blocks.
+// Indent jumps are clamped to one level; a kind change at the same depth
+// starts a sibling list. The inner paragraph shares the item's id so the
+// block survives a list lift (paragraph becomes top-level, keeps the id).
+function buildLists(run) {
+  let i = 0;
+  const build = (depth) => {
+    const kind = run[i].kind;
+    const items = []; // {id, content: [paragraph, ...sublists]}
+    while (i < run.length && run[i].indent >= depth) {
+      if (run[i].indent > depth) {
+        if (!items.length) { run[i].indent = depth; continue; } // orphan: clamp
+        items[items.length - 1].content.push(build(depth + 1));
+        continue;
+      }
+      if (run[i].kind !== kind) break;
+      const b = run[i++];
+      items.push({ id: b.id, content: [schema.node("paragraph", { id: b.id }, parseInline(b.html))] });
+    }
+    return schema.node(kind === "ordered" ? "ordered_list" : "bullet_list", null,
+      items.map((it) => schema.node("list_item", { id: it.id }, it.content)));
+  };
+  const lists = [];
+  while (i < run.length) { run[i].indent = 0; lists.push(build(0)); }
+  return lists;
+}
+
 function blocksToDoc(blocks) {
   const children = [];
-  let group = null; // open list or blockquote: {kind, items}
-  const flush = () => {
-    if (!group) return;
-    if (group.kind === "blockquote") children.push(schema.node("blockquote", null, group.items));
-    else children.push(schema.node(group.kind, null, group.items));
-    group = null;
+  let quote = null; // open blockquote: list of paragraphs
+  const flushQuote = () => {
+    if (quote) { children.push(schema.node("blockquote", null, quote)); quote = null; }
   };
 
-  for (const b of blocks) {
+  let i = 0;
+  while (i < blocks.length) {
+    const b = blocks[i];
     if (b.type === "list_item") {
-      const kind = b.attrs?.list === "ordered" ? "ordered_list" : "bullet_list";
-      // The inner paragraph shares the block id so the block survives a list
-      // lift (paragraph becomes top-level and keeps the id).
-      const item = schema.node("list_item", { id: b.id },
-        [schema.node("paragraph", { id: b.id }, parseInline(b.html))]);
-      if (!group || group.kind !== kind) { flush(); group = { kind, items: [] }; }
-      group.items.push(item);
+      flushQuote();
+      const run = [];
+      while (i < blocks.length && blocks[i].type === "list_item") {
+        const rb = blocks[i++];
+        run.push({
+          id: rb.id, html: rb.html,
+          kind: rb.attrs?.list === "ordered" ? "ordered" : "bullet",
+          indent: Math.max(Math.floor(rb.attrs?.indent) || 0, 0),
+        });
+      }
+      children.push(...buildLists(run));
       continue;
     }
+    i++;
     if (b.type === "blockquote") {
-      const p = schema.node("paragraph", { id: b.id }, parseInline(b.html));
-      if (!group || group.kind !== "blockquote") { flush(); group = { kind: "blockquote", items: [] }; }
-      group.items.push(p);
+      quote = quote || [];
+      quote.push(schema.node("paragraph", { id: b.id }, parseInline(b.html)));
       continue;
     }
-    flush();
+    flushQuote();
     if (b.type === "heading") {
       const level = Math.min(Math.max(b.attrs?.level || 1, 1), 3);
       children.push(schema.node("heading", { id: b.id, level }, parseInline(b.html)));
@@ -121,7 +164,7 @@ function blocksToDoc(blocks) {
       children.push(schema.node("paragraph", { id: b.id }, parseInline(b.html)));
     }
   }
-  flush();
+  flushQuote();
   if (!children.length) children.push(schema.node("paragraph", { id: newId() }));
   return schema.node("doc", null, children);
 }
@@ -176,10 +219,14 @@ const pendingPlugin = new Plugin({
       if (!pending || ![...pending.values()].some(Boolean)) return null;
       const decos = [];
       state.doc.descendants((node, pos) => {
-        if (ID_TYPES.has(node.type.name) && pending.get(node.attrs.id)) {
+        if (!ID_TYPES.has(node.type.name)) return true;
+        // Paragraphs inside list items share the item's id; decorate the item.
+        const inItem = node.type.name === "paragraph" &&
+          state.doc.resolve(pos).parent.type.name === "list_item";
+        if (!inItem && pending.get(node.attrs.id)) {
           decos.push(Decoration.node(pos, pos + node.nodeSize, { class: "pending" }));
         }
-        return node.type.name !== "list_item";
+        return true;
       });
       return DecorationSet.create(state.doc, decos);
     },
@@ -207,7 +254,10 @@ function buildKeymap() {
     "Backspace": undoInputRule,
     "Enter": splitListItem(schema.nodes.list_item),
     "Mod-Enter": exitCode,
+    "Tab": sinkListItem(schema.nodes.list_item),
     "Shift-Tab": liftListItem(schema.nodes.list_item),
+    "Mod-]": sinkListItem(schema.nodes.list_item),
+    "Mod-[": liftListItem(schema.nodes.list_item),
   });
 }
 
@@ -231,7 +281,9 @@ let view = null;
 let ws = null;
 let currentDoc = null;          // {id, title, languages}
 let lang = localStorage.getItem("babbel-lang") || "en";
-let lastReceived = new Map();   // block id -> html the server has for our lang
+let lastReceived = new Map();   // block id -> {html, sig} the server has for our lang
+
+const sigOf = (b) => `${b.type}|${JSON.stringify(b.attrs || {})}`;
 let sendTimer = null;
 let applyingRemote = false;
 let skippedRemote = false;
@@ -293,11 +345,17 @@ function sendUpdate() {
   const blocks = docToBlocks(view.state.doc);
   let changed = false;
   const payload = blocks.map((b) => {
-    if (lastReceived.has(b.id) && lastReceived.get(b.id) === b.html) {
+    const prev = lastReceived.get(b.id);
+    const sig = sigOf(b);
+    if (prev && prev.html === b.html) {
+      // Text untouched: omit html so the server keeps all translations, but
+      // type/attrs changes (heading toggle, list indent) still count as edits.
+      if (prev.sig !== sig) changed = true;
+      prev.sig = sig;
       return { id: b.id, type: b.type, attrs: b.attrs };
     }
     changed = true;
-    lastReceived.set(b.id, b.html);
+    lastReceived.set(b.id, { html: b.html, sig });
     return b;
   });
   const removed = lastReceived.size !== blocks.length;
@@ -314,7 +372,7 @@ function applyRemote(blocks) {
   if (!view) return;
   if (hasUnsentChanges()) { skippedRemote = true; return; }
 
-  lastReceived = new Map(blocks.map((b) => [b.id, b.html]));
+  lastReceived = new Map(blocks.map((b) => [b.id, { html: b.html, sig: sigOf(b) }]));
   const pending = new Map(blocks.map((b) => [b.id, !!b.pending]));
   const newDoc = blocksToDoc(blocks);
 

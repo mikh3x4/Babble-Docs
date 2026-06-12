@@ -666,6 +666,7 @@ h2 { font-size: 14pt; margin: 1em 0 0.4em; }
 h3 { font-size: 12pt; margin: 1em 0 0.4em; }
 p { margin: 0 0 0.6em; }
 ul, ol { margin: 0 0 0.6em; padding-left: 1.6em; }
+ul ul, ul ol, ol ul, ol ol { margin-bottom: 0; }
 blockquote { margin: 0 0 0.6em; padding: 0.1em 0 0.1em 1em; border-left: 3pt solid #bbb; color: #444; }
 pre { background: #f4f4f4; border: 0.5pt solid #ddd; padding: 0.6em; font-family: 'DejaVu Sans Mono', monospace; font-size: 9.5pt; white-space: pre-wrap; }
 code { font-family: 'DejaVu Sans Mono', monospace; font-size: 0.9em; background: #f4f4f4; }
@@ -675,20 +676,29 @@ a { color: #0645ad; }
 
 def blocks_to_html(doc: dict, lang: str) -> str:
     parts = [f'<h1 class="doc-title">{escape_html(doc["title"])}</h1>']
-    open_list = None
+    stack: list[str] = []  # open list tags, one per nesting level
+
+    def close_to(depth: int):
+        while len(stack) > depth:
+            parts.append(f"</{stack.pop()}>")
+
     for b in render_blocks(doc, lang):
         if b["type"] == "list_item":
             tag = "ol" if b["attrs"].get("list") == "ordered" else "ul"
-            if open_list != tag:
-                if open_list:
-                    parts.append(f"</{open_list}>")
+            try:
+                indent = max(int(b["attrs"].get("indent", 0) or 0), 0)
+            except (TypeError, ValueError):
+                indent = 0
+            depth = min(indent, len(stack))  # no skipping levels
+            close_to(depth + 1)
+            if stack and len(stack) == depth + 1 and stack[-1] != tag:
+                close_to(depth)  # sibling list of the other kind
+            if len(stack) == depth:
                 parts.append(f"<{tag}>")
-                open_list = tag
+                stack.append(tag)
             parts.append(f"<li>{b['html']}</li>")
             continue
-        if open_list:
-            parts.append(f"</{open_list}>")
-            open_list = None
+        close_to(0)
         if b["type"] == "heading":
             level = min(max(int(b["attrs"].get("level", 1)), 1), 3)
             parts.append(f"<h{level}>{b['html']}</h{level}>")
@@ -698,8 +708,7 @@ def blocks_to_html(doc: dict, lang: str) -> str:
             parts.append(f"<pre>{b['html']}</pre>")
         else:
             parts.append(f"<p>{b['html'] or '&nbsp;'}</p>")
-    if open_list:
-        parts.append(f"</{open_list}>")
+    close_to(0)
     return f"<html><head><meta charset='utf-8'><style>{PDF_CSS}</style></head><body>{''.join(parts)}</body></html>"
 
 

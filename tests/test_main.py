@@ -239,3 +239,35 @@ def test_blocks_to_html_switches_list_kind():
     ])
     html = blocks_to_html(doc, "en")
     assert "</ul><ol>" in html
+
+
+def test_blocks_to_html_nested_lists():
+    doc = make_doc([
+        block("b1", {"en": "top"}, btype="list_item", attrs={"list": "bullet", "indent": 0}),
+        block("b2", {"en": "sub"}, btype="list_item", attrs={"list": "bullet", "indent": 1}),
+        block("b3", {"en": "subsub"}, btype="list_item", attrs={"list": "ordered", "indent": 2}),
+        block("b4", {"en": "back"}, btype="list_item", attrs={"list": "bullet", "indent": 0}),
+    ])
+    html = blocks_to_html(doc, "en")
+    assert ("<ul><li>top</li><ul><li>sub</li><ol><li>subsub</li></ol></ul>"
+            "<li>back</li></ul>") in html
+
+
+def test_blocks_to_html_clamps_indent_jumps():
+    # First item can't start at indent 3; level skips collapse to one level.
+    doc = make_doc([
+        block("b1", {"en": "a"}, btype="list_item", attrs={"list": "bullet", "indent": 3}),
+        block("b2", {"en": "b"}, btype="list_item", attrs={"list": "bullet", "indent": 9}),
+    ])
+    html = blocks_to_html(doc, "en")
+    assert "<ul><li>a</li><ul><li>b</li></ul></ul>" in html
+
+
+def test_blocks_to_html_nested_list_closes_before_paragraph():
+    doc = make_doc([
+        block("b1", {"en": "a"}, btype="list_item", attrs={"list": "bullet", "indent": 0}),
+        block("b2", {"en": "b"}, btype="list_item", attrs={"list": "bullet", "indent": 1}),
+        block("b3", {"en": "after"}),
+    ])
+    html = blocks_to_html(doc, "en")
+    assert "</ul></ul><p>after</p>" in html
