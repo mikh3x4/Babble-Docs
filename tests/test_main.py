@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from main import (
     sanitize_inline_html, merge_blocks, render_blocks, blocks_to_html,
+    split_sentences_html, plan_sentence_updates,
 )
 
 
@@ -127,6 +128,75 @@ def test_merge_empty_blocks_skip_translation():
     dirty = merge_blocks(doc, [{"id": "b1", "type": "paragraph", "html": ""}], "en")
     assert dirty == []
     assert doc["blocks"][0]["pending"] == []
+
+
+# --- sentence splitting ----------------------------------------------------------
+
+def test_split_basic_sentences():
+    assert split_sentences_html("One. Two! Three?") == ["One. ", "Two! ", "Three?"]
+
+
+def test_split_segments_concatenate_losslessly():
+    html = "One.  Two <strong>bold</strong>. Three."
+    assert "".join(split_sentences_html(html)) == html
+
+
+def test_split_keeps_tag_spanning_sentences_together():
+    # Enders inside an open tag never split (would create invalid fragments),
+    # so a mark spanning sentences conservatively keeps the run together.
+    assert split_sentences_html("<strong>One. Two.</strong> Three.") == \
+        ["<strong>One. Two.</strong> Three."]
+    assert split_sentences_html("A <strong>bold</strong>. Next.") == \
+        ["A <strong>bold</strong>. ", "Next."]
+
+
+def test_split_does_not_break_decimals_or_urls():
+    assert split_sentences_html("Pi is 3.14 ok") == ["Pi is 3.14 ok"]
+    assert split_sentences_html('See <a href="https://a.b/c.d">x</a>. Next.') == \
+        ['See <a href="https://a.b/c.d">x</a>. ', "Next."]
+
+
+def test_split_cjk_without_spaces():
+    assert split_sentences_html("你好。再见！") == ["你好。", "再见！"]
+
+
+def test_split_trailing_text_without_ender():
+    assert split_sentences_html("Done. still typing") == ["Done. ", "still typing"]
+
+
+# --- sentence update planning -------------------------------------------------------
+
+def test_plan_only_edited_sentence_translates():
+    old = "One. Two. Three."
+    new = "One. 2222. Three."
+    tgt = "Raz. Dwa. Trzy."
+    ops = plan_sentence_updates(old, new, tgt)
+    assert ops == [("keep", "Raz. "), ("translate", "2222. "), ("keep", "Trzy.")]
+
+
+def test_plan_inserted_sentence():
+    ops = plan_sentence_updates("One. Two.", "One. New! Two.", "Raz. Dwa.")
+    assert ops == [("keep", "Raz. "), ("translate", "New! "), ("keep", "Dwa.")]
+
+
+def test_plan_deleted_sentence():
+    ops = plan_sentence_updates("One. Two. Three.", "One. Three.", "Raz. Dwa. Trzy.")
+    assert ops == [("keep", "Raz. "), ("keep", "Trzy.")]
+
+
+def test_plan_falls_back_when_unalignable():
+    # Target has a different sentence count than the old source: no alignment.
+    assert plan_sentence_updates("One. Two.", "One. Two!", "Raz.") is None
+    assert plan_sentence_updates(None, "One.", "Raz.") is None
+
+
+def test_merge_tracks_prev_html_for_sentence_diffing():
+    doc = make_doc([block("b1", {"en": "One. Two.", "pl": "Raz. Dwa."})])
+    merge_blocks(doc, [{"id": "b1", "type": "paragraph", "html": "One. 2222."}], "en")
+    assert doc["blocks"][0]["prev_html"] == "One. Two."
+    # A second edit while still pending keeps the original prev_html.
+    merge_blocks(doc, [{"id": "b1", "type": "paragraph", "html": "One. 3333."}], "en")
+    assert doc["blocks"][0]["prev_html"] == "One. Two."
 
 
 # --- render_blocks ---------------------------------------------------------------

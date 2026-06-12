@@ -10,6 +10,7 @@ document's other languages with Claude.
 import os
 import re
 import json
+import difflib
 import asyncio
 import logging
 import secrets
@@ -114,6 +115,80 @@ def strip_tags(html: str) -> str:
     return re.sub(r"<[^>]+>", "", html or "")
 
 
+# --- Sentence segmentation ---------------------------------------------------
+# Blocks are translated sentence-by-sentence: when a paragraph is edited, only
+# the changed sentences are sent to the model (with the paragraph as context).
+
+ASCII_ENDERS = ".!?"
+CJK_ENDERS = "。！？"  # 。！？
+
+
+def split_sentences_html(html: str) -> list[str]:
+    """Split inline HTML into sentence segments.
+
+    Splits only at tag-balanced positions (a <strong> spanning two sentences
+    keeps them in one segment) and keeps end punctuation plus trailing spaces
+    attached to the preceding sentence, so segments concatenate losslessly.
+    ASCII enders must be followed by whitespace or end-of-text (so "3.14" and
+    "e.com/x.y" don't split); CJK enders split unconditionally.
+    """
+    parts, depth, start, i, n = [], 0, 0, 0, len(html)
+    while i < n:
+        c = html[i]
+        if c == "<":
+            close = html.find(">", i)
+            if close == -1:
+                break
+            name = html[i + 1:close].strip("/ ").split()[0].lower() if close > i + 1 else ""
+            if html[i + 1] == "/":
+                depth -= 1
+            elif name != "br" and not html[i + 1:close].endswith("/"):
+                depth += 1
+            i = close + 1
+            continue
+        if depth == 0 and c in ASCII_ENDERS + CJK_ENDERS:
+            j = i + 1
+            while j < n and html[j] in ASCII_ENDERS + CJK_ENDERS:
+                j += 1
+            cjk = any(ch in CJK_ENDERS for ch in html[i:j])
+            if cjk or j >= n or html[j].isspace():
+                while j < n and html[j] in " \xa0\t":
+                    j += 1
+                parts.append(html[start:j])
+                start = i = j
+                continue
+        i += 1
+    if start < n:
+        parts.append(html[start:])
+    return [p for p in parts if p]
+
+
+def plan_sentence_updates(old_src_html: str | None, new_src_html: str,
+                          existing_tgt_html: str | None) -> list[tuple[str, str]] | None:
+    """Plan a sentence-level update of a translated block.
+
+    Returns ops ("keep", target_sentence) / ("translate", source_sentence) in
+    output order, or None when the existing translation can't be aligned with
+    the old source (different sentence counts, no history) — in which case the
+    whole block is translated sentence by sentence.
+    """
+    if not old_src_html or not existing_tgt_html:
+        return None
+    old_sents = split_sentences_html(old_src_html)
+    tgt_sents = split_sentences_html(existing_tgt_html)
+    if len(old_sents) != len(tgt_sents):
+        return None
+    new_sents = split_sentences_html(new_src_html)
+    ops = []
+    matcher = difflib.SequenceMatcher(a=old_sents, b=new_sents, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            ops.extend(("keep", t) for t in tgt_sents[i1:i2])
+        elif tag != "delete":
+            ops.extend(("translate", s) for s in new_sents[j1:j2])
+    return ops
+
+
 # --- Document store ---------------------------------------------------------
 
 class DocStore:
@@ -199,6 +274,16 @@ def merge_blocks(doc: dict, incoming: list, lang: str) -> list[str]:
         content[lang] = html
         block = {"id": block_id, "type": btype, "attrs": attrs,
                  "content": content, "source": lang}
+        # Remember the source text the existing translations correspond to, so
+        # the translator can diff sentences and retranslate only what changed.
+        prev_html = None
+        if old:
+            if old.get("pending"):
+                prev_html = old.get("prev_html")  # mid-edit: keep the original
+            elif old.get("source") == lang:
+                prev_html = old.get("content", {}).get(lang)
+        if prev_html:
+            block["prev_html"] = prev_html
         if btype == "code" or not strip_tags(html).strip():
             # Code and empty blocks are identical in every language.
             for code in other_langs:
@@ -254,13 +339,15 @@ class TranslationManager:
                 return
             source = block["source"]
             source_html = block["content"][source]
+            prev_html = block.get("prev_html")
             targets = list(block["pending"])
             lang_names = {l["code"]: l["name"] for l in doc["languages"]}
             context = self._context(doc, block_id, source)
 
             results = await asyncio.gather(
-                *(self._translate(source_html, lang_names[source], lang_names[t],
-                                  block["content"].get(t), context) for t in targets),
+                *(self._translate_block(source_html, prev_html, block["content"].get(t),
+                                        lang_names[source], lang_names[t], context)
+                  for t in targets),
                 return_exceptions=True,
             )
 
@@ -277,6 +364,8 @@ class TranslationManager:
                     block["content"][target] = sanitize_inline_html(result)
                     if target in block.get("pending", []):
                         block["pending"].remove(target)
+            if not block.get("pending"):
+                block.pop("prev_html", None)
             store.save(doc)
             await rooms.broadcast_doc(doc)
             if errors:
@@ -297,21 +386,55 @@ class TranslationManager:
         after = " ".join(t for _, t in texts[idx + 1:idx + 3] if t)
         return {"before": before, "after": after}
 
-    async def _translate(self, html: str, source_name: str, target_name: str,
-                         existing: str | None, context: dict) -> str:
-        prompt = f"""Translate the SEGMENT below from {source_name} to {target_name}.
+    async def _translate_block(self, source_html: str, prev_html: str | None,
+                               existing: str | None, source_name: str,
+                               target_name: str, context: dict) -> str:
+        """Translate a block sentence by sentence, reusing unchanged sentences.
 
-The segment is inline HTML from a rich-text document. Preserve the HTML tags
+        When the existing translation aligns with the previous source text,
+        only the edited sentences are sent to the model; the rest of the
+        paragraph rides along as context.
+        """
+        ops = plan_sentence_updates(prev_html, source_html, existing)
+        if ops is None:
+            ops = [("translate", s) for s in split_sentences_html(source_html)]
+
+        todo = [s for op, s in ops if op == "translate"]
+        total = len(split_sentences_html(source_html))
+        if not todo:
+            return "".join(s for _, s in ops)
+        logger.info(f"Translating {len(todo)}/{total} sentences to {target_name}")
+
+        translated = await asyncio.gather(
+            *(self._translate_sentence(s, source_html, existing, source_name,
+                                       target_name, context) for s in todo))
+        results = iter(translated)
+        parts = []
+        for op, s in ops:
+            if op == "keep":
+                parts.append(s)
+            else:
+                trailing_ws = re.search(r"\s*$", s).group()
+                parts.append(next(results) + trailing_ws)
+        return "".join(parts)
+
+    async def _translate_sentence(self, sentence: str, source_paragraph: str,
+                                  target_paragraph: str | None, source_name: str,
+                                  target_name: str, context: dict) -> str:
+        prompt = f"""Translate ONE SENTENCE from {source_name} to {target_name}.
+
+The sentence is inline HTML from a rich-text document. Preserve the HTML tags
 (<strong>, <em>, <u>, <s>, <code>, <a>, <br>) around the corresponding words in
-the translation; translate only the text.
+the translation; translate only the text. Keep equivalent end punctuation.
 
-Document context before the segment: {context['before'] or '(start of document)'}
-Document context after the segment: {context['after'] or '(end of document)'}
-{f'Previous translation, possibly outdated: {existing}' if existing else ''}
+Document context before the paragraph: {context['before'] or '(start of document)'}
+Full paragraph ({source_name}): {strip_tags(source_paragraph)}
+Document context after the paragraph: {context['after'] or '(end of document)'}
+{f'Current paragraph translation ({target_name}), the sentence must fit into it: {target_paragraph}' if target_paragraph else ''}
 
-SEGMENT: {html}
+SENTENCE TO TRANSLATE: {sentence}
 
-Reply with ONLY the translated inline HTML — no quotes, no explanation."""
+Reply with ONLY the translated sentence as inline HTML — no quotes, no explanation."""
         response = await anthropic_client.messages.create(
             model=TRANSLATION_MODEL,
             max_tokens=2000,
