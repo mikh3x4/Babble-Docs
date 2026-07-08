@@ -749,6 +749,6 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting server on 0.0.0.0:8000 (model: {TRANSLATION_MODEL})")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True,
+    logger.info(f"Starting server on 0.0.0.0:8100 (model: {TRANSLATION_MODEL})")
+    uvicorn.run("main:app", host="0.0.0.0", port=8100, reload=True,
                 reload_excludes=["*.log", "docs/*"])
