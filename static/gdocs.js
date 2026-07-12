@@ -14,7 +14,29 @@ let tokenClient = null;
 let accessToken = null;
 let tokenExpiry = 0; // ms epoch
 
+// Persist the OAuth token so new windows/reloads within its ~1h lifetime
+// don't need a sign-in click. (Trade-off: the token sits in localStorage;
+// it's scoped to Docs/Drive and expires within the hour.)
+const TOKEN_KEY = "babel-token";
+
+function restoreToken() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(TOKEN_KEY) || "null");
+    if (saved && saved.expiry > Date.now() + 60_000) {
+      accessToken = saved.token;
+      tokenExpiry = saved.expiry;
+    }
+  } catch { /* ignore */ }
+}
+
+function storeToken() {
+  try {
+    localStorage.setItem(TOKEN_KEY, JSON.stringify({ token: accessToken, expiry: tokenExpiry }));
+  } catch { /* ignore */ }
+}
+
 export function initAuth() {
+  restoreToken();
   return new Promise((resolve, reject) => {
     const check = () => {
       if (window.google?.accounts?.oauth2) {
@@ -42,6 +64,7 @@ export function signIn({ silent = false } = {}) {
       if (resp.error) return reject(new Error(resp.error_description || resp.error));
       accessToken = resp.access_token;
       tokenExpiry = Date.now() + (resp.expires_in - 60) * 1000;
+      storeToken();
       resolve(accessToken);
     };
     tokenClient.error_callback = (err) => reject(new Error(err.message || err.type || "sign-in failed"));
@@ -49,7 +72,7 @@ export function signIn({ silent = false } = {}) {
   });
 }
 
-export const isSignedIn = () => !!accessToken;
+export const isSignedIn = () => !!accessToken && Date.now() < tokenExpiry;
 
 async function ensureToken() {
   if (!accessToken) throw new Error("Not signed in");
@@ -86,6 +109,12 @@ async function gfetch(url, options = {}, retry = true) {
 
 export function getDocument(docId) {
   return gfetch(`${DOCS}/documents/${docId}?includeTabsContent=true`);
+}
+
+export function getRevisionId(docId) {
+  // Cheap change probe straight from the Docs API — the Drive `version`
+  // field can lag behind actual content changes for Docs editor files.
+  return gfetch(`${DOCS}/documents/${docId}?fields=revisionId`).then((d) => d.revisionId);
 }
 
 export function batchUpdate(docId, requests) {

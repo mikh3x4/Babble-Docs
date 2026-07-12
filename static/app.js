@@ -287,7 +287,7 @@ const els = {
   recentList: $("recent-list"), landingStatus: $("landing-status"),
   setupLang: $("setup-lang"), setupKey: $("setup-key"), setupGo: $("setup-go"),
   setupStatus: $("setup-status"), setupDocName: $("setup-doc-name"),
-  docName: $("doc-name"), openInDocs: $("open-in-docs"), share: $("share"),
+  docName: $("doc-name"), openInDocs: $("open-in-docs"), share: $("share"), openOther: $("open-other"),
   cost: $("cost"), translating: $("translating"), syncDot: $("sync-dot"), syncText: $("sync-text"),
   langSelect: $("lang-select"), addLang: $("add-lang"),
   addLangPanel: $("add-lang-panel"), addLangInput: $("add-lang-input"),
@@ -305,6 +305,8 @@ let lang = null;
 let model = null;              // parsed babel:meta JSON — the canonical document model
 let docSnapshot = null;        // last fetched documents.get result
 let lastVersion = null;        // Drive file version we've already pulled
+let lastRevision = null;       // Docs revisionId we've already pulled
+let pollTick = 0;
 let lastReceived = new Map();  // block id -> {html, sig} last rendered for our lang
 let sendTimer = null;
 let applyingRemote = false;
@@ -612,6 +614,7 @@ els.toolbar.addEventListener("mousedown", (e) => {
 
 async function refreshSnapshot() {
   docSnapshot = await G.getDocument(docId);
+  lastRevision = docSnapshot.revisionId;
   const meta = await G.getFileMeta(docId);
   lastVersion = meta.version;
   docName = meta.name;
@@ -673,6 +676,7 @@ function queueWrite(tabPlans, metaChanged) {
 async function pullDoc() {
   const doc = await G.getDocument(docId);
   docSnapshot = doc;
+  lastRevision = doc.revisionId;
   const metaTab = D.findMetaTab(doc);
   const meta = metaTab ? D.parseMeta(metaTab) : null;
   if (!meta) { enterSetup(doc); return; }
@@ -734,22 +738,35 @@ async function pullDoc() {
 async function pollLoop() {
   clearTimeout(pollTimer);
   try {
-    if (!writing) {
+    if (!writing && model) {
+      // Cheap Drive-version check every tick; every 4th tick also probe the
+      // Docs revisionId, since Drive's version field can lag content changes.
       const meta = await G.getFileMeta(docId);
-      if (meta.version !== lastVersion) {
-        lastVersion = meta.version;
+      let changed = meta.version !== lastVersion;
+      if (!changed && pollTick % 4 === 3) {
+        changed = (await G.getRevisionId(docId)) !== lastRevision;
+      }
+      if (changed) {
         docName = meta.name;
         els.docName.textContent = docName;
         await pullDoc();
+        lastVersion = meta.version; // commit only after a successful pull
       }
       setSync("on", "Synced");
     }
   } catch (err) {
     console.error(err);
-    setSync("off", "Reconnecting…");
+    setSync("off", /sign|popup|401/i.test(err.message) ? "Sign-in expired — reload" : "Reconnecting…");
   }
+  pollTick += 1;
   pollTimer = setTimeout(pollLoop, 500);
 }
+
+// Pull immediately when the window regains focus, so switching between two
+// windows feels instant.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && docId && model) pollLoop();
+});
 
 // --- Locks (Drive comments) -----------------------------------------------------------
 
@@ -1091,20 +1108,47 @@ els.landingOpen.onclick = () => {
 };
 els.landingUrl.onkeydown = (e) => { if (e.key === "Enter") els.landingOpen.onclick(); };
 
+function showLanding() {
+  showView("landing");
+  const signedIn = G.isSignedIn();
+  els.signIn.hidden = signedIn;
+  document.getElementById("landing-open-row").hidden = !signedIn;
+  els.landingStatus.textContent = "";
+  if (signedIn) renderRecent();
+}
+
+function openFromUrl() {
+  const fromUrl = G.extractDocId(new URL(location.href).searchParams.get("doc") || "");
+  if (fromUrl) openDoc(fromUrl);
+  return !!fromUrl;
+}
+
 els.signIn.onclick = async () => {
   try {
     els.landingStatus.textContent = "Signing in…";
     await G.signIn();
-    els.signIn.hidden = true;
-    els.landingStatus.textContent = "";
-    document.getElementById("landing-open-row").hidden = false;
-    renderRecent();
-    const params = new URL(location.href).searchParams;
-    const fromUrl = G.extractDocId(params.get("doc") || "");
-    if (fromUrl) openDoc(fromUrl);
+    showLanding();
+    openFromUrl();
   } catch (err) {
     els.landingStatus.textContent = `Sign-in failed: ${err.message}`;
   }
+};
+
+els.openOther.onclick = () => {
+  // Leave the current document and go back to the landing page.
+  clearTimeout(pollTimer);
+  clearTimeout(sendTimer);
+  sendTimer = null;
+  for (const t of translateTimers.values()) clearTimeout(t);
+  translateTimers.clear();
+  model = null; docId = null; docSnapshot = null;
+  lastVersion = null; lastRevision = null;
+  lastReceived = new Map();
+  const url = new URL(location.href);
+  url.searchParams.delete("doc");
+  url.searchParams.delete("lang");
+  history.replaceState(null, "", url);
+  showLanding();
 };
 
 (async function boot() {
@@ -1116,7 +1160,11 @@ els.signIn.onclick = async () => {
     els.signIn.disabled = false;
   } catch (err) {
     els.landingStatus.textContent = err.message;
+    return;
   }
+  showLanding();
+  // A token persisted from a previous window/session: skip the sign-in click.
+  if (G.isSignedIn()) openFromUrl();
 })();
 
 window.babbel = { toMarkdown: () => mdSerializer.serialize(view.state.doc), insertMarkdown };
