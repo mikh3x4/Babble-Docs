@@ -17,7 +17,7 @@ import {
   MarkdownSerializer, MarkdownParser, defaultMarkdownSerializer, defaultMarkdownParser, markdownit,
   basicSchema, addListNodes, splitListItem, liftListItem, sinkListItem, wrapInList as pmWrapInList,
   keymap, baseKeymap, toggleMark, setBlockType, wrapIn, lift, chainCommands, exitCode,
-  history, undo, redo,
+  history as pmHistory, undo, redo,
   inputRules, wrappingInputRule, textblockTypeInputRule, undoInputRule,
   dropCursor, gapCursor,
 } from "./vendor/prosemirror.js";
@@ -364,7 +364,7 @@ function createEditor() {
     schema,
     plugins: [
       buildInputRules(), buildKeymap(), keymap(baseKeymap),
-      dropCursor(), gapCursor(), history(),
+      dropCursor(), gapCursor(), pmHistory(),
       idPlugin, pendingPlugin,
     ],
   });
