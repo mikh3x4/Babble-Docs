@@ -1,0 +1,141 @@
+// Google auth + API layer: Google Identity Services token flow, and thin
+// fetch wrappers for the Docs API (documents, tabs, named ranges) and the
+// Drive API (file metadata for change polling, comments used as locks).
+
+const CLIENT_ID = "611282666479-c3p3ml2bauacistvm7i9kb08esth33nh.apps.googleusercontent.com";
+// `documents` for reading/writing the doc; `drive` for comments (locks) and
+// cheap change polling via files.get(version).
+const SCOPES = "https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive";
+
+const DOCS = "https://docs.googleapis.com/v1";
+const DRIVE = "https://www.googleapis.com/drive/v3";
+
+let tokenClient = null;
+let accessToken = null;
+let tokenExpiry = 0; // ms epoch
+
+export function initAuth() {
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (window.google?.accounts?.oauth2) {
+        tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: CLIENT_ID,
+          scope: SCOPES,
+          callback: () => {}, // set per request
+        });
+        resolve();
+      } else if (Date.now() > deadline) {
+        reject(new Error("Google Identity Services failed to load"));
+      } else {
+        setTimeout(check, 100);
+      }
+    };
+    const deadline = Date.now() + 15000;
+    check();
+  });
+}
+
+export function signIn({ silent = false } = {}) {
+  // Resolves with an access token; shows the Google consent popup when needed.
+  return new Promise((resolve, reject) => {
+    tokenClient.callback = (resp) => {
+      if (resp.error) return reject(new Error(resp.error_description || resp.error));
+      accessToken = resp.access_token;
+      tokenExpiry = Date.now() + (resp.expires_in - 60) * 1000;
+      resolve(accessToken);
+    };
+    tokenClient.error_callback = (err) => reject(new Error(err.message || err.type || "sign-in failed"));
+    tokenClient.requestAccessToken({ prompt: silent ? "" : undefined });
+  });
+}
+
+export const isSignedIn = () => !!accessToken;
+
+async function ensureToken() {
+  if (!accessToken) throw new Error("Not signed in");
+  if (Date.now() > tokenExpiry) await signIn({ silent: true });
+  return accessToken;
+}
+
+async function gfetch(url, options = {}, retry = true) {
+  const token = await ensureToken();
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  if (res.status === 401 && retry) {
+    await signIn({ silent: true });
+    return gfetch(url, options, false);
+  }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).error?.message || detail; } catch { /* keep statusText */ }
+    const err = new Error(`Google API: ${detail}`);
+    err.status = res.status;
+    throw err;
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// --- Docs API -----------------------------------------------------------------
+
+export function getDocument(docId) {
+  return gfetch(`${DOCS}/documents/${docId}?includeTabsContent=true`);
+}
+
+export function batchUpdate(docId, requests) {
+  if (!requests.length) return Promise.resolve({ replies: [] });
+  return gfetch(`${DOCS}/documents/${docId}:batchUpdate`, {
+    method: "POST",
+    body: JSON.stringify({ requests }),
+  });
+}
+
+export async function addTab(docId, title) {
+  const resp = await batchUpdate(docId, [{ addDocumentTab: { tabProperties: { title } } }]);
+  return resp.replies[0].addDocumentTab.tabProperties.tabId;
+}
+
+export function renameTab(docId, tabId, title) {
+  return batchUpdate(docId, [{
+    updateDocumentTabProperties: { tabProperties: { tabId, title }, fields: "title" },
+  }]);
+}
+
+// --- Drive API ------------------------------------------------------------------
+
+export function getFileMeta(docId) {
+  // version bumps on every content change — the cheap poll target.
+  return gfetch(`${DRIVE}/files/${docId}?fields=version,name,capabilities(canEdit,canComment)`);
+}
+
+export function listComments(docId) {
+  return gfetch(
+    `${DRIVE}/files/${docId}/comments?fields=comments(id,content,createdTime,author(displayName,me))&pageSize=100`,
+  ).then((r) => r.comments || []);
+}
+
+export function createComment(docId, content) {
+  return gfetch(`${DRIVE}/files/${docId}/comments?fields=id,createdTime`, {
+    method: "POST",
+    body: JSON.stringify({ content }),
+  });
+}
+
+export function deleteComment(docId, commentId) {
+  return gfetch(`${DRIVE}/files/${docId}/comments/${commentId}`, { method: "DELETE" })
+    .catch((err) => { if (err.status !== 404) throw err; });
+}
+
+// --- URL helpers ------------------------------------------------------------------
+
+export function extractDocId(text) {
+  const m = String(text || "").match(/\/document\/(?:u\/\d+\/)?d\/([-\w]{20,})/) ||
+    String(text || "").trim().match(/^([-\w]{20,})$/);
+  return m ? m[1] : null;
+}

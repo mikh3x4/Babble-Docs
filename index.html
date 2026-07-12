@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Babbel Docs</title>
+  <link rel="stylesheet" href="static/vendor/prosemirror.css">
+  <link rel="stylesheet" href="static/style.css">
+  <script src="https://accounts.google.com/gsi/client" async></script>
+</head>
+<body>
+
+  <!-- Landing: sign in + pick a document -->
+  <div id="view-landing" class="centered" hidden>
+    <div class="card">
+      <h1>Babbel Docs</h1>
+      <p class="tagline">A collaborative editor where everyone reads and writes the same
+        document in their own language. A Google Doc is the storage — one tab per
+        language, translated sentence-by-sentence with Claude.</p>
+      <button id="sign-in" class="primary" disabled>Sign in with Google</button>
+      <div id="landing-open-row" hidden>
+        <label for="landing-url">Open a Google Doc</label>
+        <div class="row">
+          <input id="landing-url" placeholder="Paste a Google Docs URL…" autocomplete="off">
+          <button id="landing-open" class="primary">Open</button>
+        </div>
+        <ul id="recent-list" hidden></ul>
+      </div>
+      <p id="landing-status" class="status"></p>
+    </div>
+  </div>
+
+  <!-- Setup: doc has no babel:meta tab yet -->
+  <div id="view-setup" class="centered" hidden>
+    <div class="card">
+      <h1>Set up <span id="setup-doc-name"></span> for Babbel Docs</h1>
+      <p>Babbel Docs turns this Google Doc into a multilingual document: it adds a
+        <code>babel:meta</code> tab for settings and keeps one tab per language.
+        Whenever someone edits a sentence in any language, it's retranslated into
+        the other languages with Claude. The current content of the first tab
+        becomes the first language.</p>
+      <label for="setup-lang">Language of the existing content</label>
+      <input id="setup-lang" list="lang-catalog" value="English" autocomplete="off">
+      <label for="setup-key">Anthropic API key (for translation, model: Claude Sonnet)</label>
+      <input id="setup-key" type="password" placeholder="sk-ant-…" autocomplete="off">
+      <p class="warning">⚠️ The key is stored inside the Google Doc's <code>babel:meta</code> tab.
+        <strong>Anyone with read access to this document can see and use the key.</strong>
+        Only share the document with people you trust with it, and use a key with a
+        spend limit.</p>
+      <button id="setup-go" class="primary">Set up document</button>
+      <p id="setup-status" class="status"></p>
+    </div>
+  </div>
+
+  <!-- Editor -->
+  <div id="view-editor" hidden>
+    <header id="topbar">
+      <span id="doc-name" title="Document name (rename it in Google Docs)"></span>
+      <a id="open-in-docs" href="#" target="_blank" title="Open in Google Docs">↗ Docs</a>
+      <div class="topbar-right">
+        <span id="readonly-note" title="You have view-only access to this document" hidden>read-only</span>
+        <span id="cost" title="Claude translation cost for this document" hidden></span>
+        <span id="translating" hidden>Translating…</span>
+        <select id="lang-select" title="Language"></select>
+        <button id="add-lang" title="Add a language">+ lang</button>
+        <button id="share" title="Copy a link that opens this document in this language">Share</button>
+        <span id="sync-dot" class="dot"></span><span id="sync-text">Connecting…</span>
+      </div>
+    </header>
+
+    <div id="add-lang-panel" hidden>
+      <input id="add-lang-input" list="lang-catalog" placeholder="Language (e.g. Spanish or es)">
+      <button id="add-lang-confirm">Add</button>
+      <button id="add-lang-cancel">Cancel</button>
+    </div>
+
+    <div id="toolbar">
+      <button data-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+      <button data-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+      <button data-cmd="underline" title="Underline (Ctrl+U)"><u>U</u></button>
+      <button data-cmd="strike" title="Strikethrough"><s>S</s></button>
+      <button data-cmd="code" title="Inline code">&lt;&gt;</button>
+      <button data-cmd="link" title="Link">🔗</button>
+      <span class="sep"></span>
+      <button data-cmd="paragraph" title="Paragraph">¶</button>
+      <button data-cmd="h1" title="Heading 1">H1</button>
+      <button data-cmd="h2" title="Heading 2">H2</button>
+      <button data-cmd="h3" title="Heading 3">H3</button>
+      <span class="sep"></span>
+      <button data-cmd="bullet" title="Bullet list">•≡</button>
+      <button data-cmd="ordered" title="Numbered list">1≡</button>
+      <button data-cmd="quote" title="Blockquote">❝</button>
+      <button data-cmd="codeblock" title="Code block">{ }</button>
+      <span class="sep"></span>
+      <button data-cmd="undo" title="Undo (Ctrl+Z)">↺</button>
+      <button data-cmd="redo" title="Redo (Ctrl+Y)">↻</button>
+      <span class="sep"></span>
+      <button data-cmd="copymd" class="wide" title="Copy the document as Markdown">Copy MD</button>
+      <button data-cmd="pastemd" class="wide" title="Paste Markdown from the clipboard at the cursor">Paste MD</button>
+    </div>
+
+    <div id="editor-scroll"><div id="editor"></div></div>
+  </div>
+
+  <datalist id="lang-catalog"></datalist>
+  <div id="toast" hidden></div>
+  <script type="module" src="static/app.js"></script>
+</body>
+</html>

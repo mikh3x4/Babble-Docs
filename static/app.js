@@ -1,9 +1,14 @@
-// Babbel Docs frontend: ProseMirror editor + document sidebar + WS sync.
+// Babbel Docs frontend: ProseMirror editor synced to a Google Doc.
 //
-// The document model shared with the server is a flat list of blocks:
-//   {id, type: paragraph|heading|list_item|blockquote|code, attrs, html}
-// where html is inline HTML in the current language. Blocks the user hasn't
-// touched are sent without "html" so the server keeps other-language content.
+// The Google Doc is the database: a `babel:meta` tab holds the canonical block
+// model (JSON: languages, API key, usage, per-language content + pending
+// flags); one tab per language holds the rendered document, with named ranges
+// carrying block ids. This client polls the Drive file version (~2Hz), pulls
+// the doc on change, merges edits (from other clients or from people typing
+// directly in Google Docs), translates changed sentences with Claude, and
+// writes results back. Translation work is locked via `[babel-lock]` Drive
+// comments so concurrent clients don't translate the same block twice; human
+// comments are left alone.
 
 import {
   EditorState, Plugin, PluginKey, TextSelection,
@@ -15,7 +20,15 @@ import {
   history, undo, redo,
   inputRules, wrappingInputRule, textblockTypeInputRule, undoInputRule,
   dropCursor, gapCursor,
-} from "/static/vendor/prosemirror.js";
+} from "./vendor/prosemirror.js";
+
+import * as G from "./gdocs.js";
+import * as D from "./docmodel.js";
+import * as T from "./translate.js";
+import {
+  LANGUAGE_CATALOG, newId, escapeHtml, sanitizeInlineHtml, stripTags,
+  mergeBlocks, renderBlocks, blockContext,
+} from "./core.js";
 
 // --- Schema -----------------------------------------------------------------
 
@@ -54,14 +67,10 @@ const mdSerializer = new MarkdownSerializer(
   },
 );
 
-// Default tokens minus nodes our schema doesn't have, plus ~~strikethrough~~.
 const mdTokens = { ...defaultMarkdownParser.tokens, s: { mark: "strikethrough" } };
 delete mdTokens.hr;
 delete mdTokens.image;
 const mdParser = new MarkdownParser(schema, markdownit({ html: false }).disable(["hr", "image"]), mdTokens);
-
-const newId = () => crypto.getRandomValues(new Uint32Array(2)).reduce((s, n) => s + n.toString(16).padStart(8, "0"), "");
-const escapeHtml = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 // --- Flat blocks <-> ProseMirror doc -----------------------------------------
 
@@ -113,17 +122,14 @@ function docToBlocks(doc) {
 }
 
 // Rebuild nested list nodes from a run of consecutive list_item blocks.
-// Indent jumps are clamped to one level; a kind change at the same depth
-// starts a sibling list. The inner paragraph shares the item's id so the
-// block survives a list lift (paragraph becomes top-level, keeps the id).
 function buildLists(run) {
   let i = 0;
   const build = (depth) => {
     const kind = run[i].kind;
-    const items = []; // {id, content: [paragraph, ...sublists]}
+    const items = [];
     while (i < run.length && run[i].indent >= depth) {
       if (run[i].indent > depth) {
-        if (!items.length) { run[i].indent = depth; continue; } // orphan: clamp
+        if (!items.length) { run[i].indent = depth; continue; }
         items[items.length - 1].content.push(build(depth + 1));
         continue;
       }
@@ -141,7 +147,7 @@ function buildLists(run) {
 
 function blocksToDoc(blocks) {
   const children = [];
-  let quote = null; // open blockquote: list of paragraphs
+  let quote = null;
   const flushQuote = () => {
     if (quote) { children.push(schema.node("blockquote", null, quote)); quote = null; }
   };
@@ -191,7 +197,6 @@ function blocksToDoc(blocks) {
 
 const ID_TYPES = new Set(["paragraph", "heading", "code_block", "list_item"]);
 
-// Assign ids to new blocks and re-id duplicates (e.g. after splitting a node).
 const idPlugin = new Plugin({
   appendTransaction(transactions, oldState, state) {
     if (!transactions.some((tr) => tr.docChanged)) return null;
@@ -199,13 +204,10 @@ const idPlugin = new Plugin({
     let tr = null;
     state.doc.descendants((node, pos) => {
       if (!ID_TYPES.has(node.type.name)) return true;
-      // Paragraphs inside list items don't carry the block id; the item does.
       const inItem = node.type.name === "paragraph" &&
         state.doc.resolve(pos).parent.type.name === "list_item";
       if (inItem) return false;
       if (node.attrs.id == null || seen.has(node.attrs.id)) {
-        // A freshly wrapped list item adopts its paragraph's id so the block
-        // keeps its identity (and translations) across paragraph <-> list.
         let id = null;
         if (node.type.name === "list_item") {
           const childId = node.firstChild?.attrs?.id;
@@ -223,7 +225,6 @@ const idPlugin = new Plugin({
   },
 });
 
-// Highlight blocks whose translation is pending in the current language.
 const pendingKey = new PluginKey("pending");
 const pendingPlugin = new Plugin({
   key: pendingKey,
@@ -238,7 +239,6 @@ const pendingPlugin = new Plugin({
       const decos = [];
       state.doc.descendants((node, pos) => {
         if (!ID_TYPES.has(node.type.name)) return true;
-        // Paragraphs inside list items share the item's id; decorate the item.
         const inItem = node.type.name === "paragraph" &&
           state.doc.resolve(pos).parent.type.name === "list_item";
         if (!inItem && pending.get(node.attrs.id)) {
@@ -253,8 +253,7 @@ const pendingPlugin = new Plugin({
 
 function buildInputRules() {
   return inputRules({ rules: [
-    textblockTypeInputRule(/^(#{1,3})\s$/, schema.nodes.heading,
-      (m) => ({ level: m[1].length })),
+    textblockTypeInputRule(/^(#{1,3})\s$/, schema.nodes.heading, (m) => ({ level: m[1].length })),
     wrappingInputRule(/^\s*([-*])\s$/, schema.nodes.bullet_list),
     wrappingInputRule(/^(\d+)\.\s$/, schema.nodes.ordered_list),
     wrappingInputRule(/^\s*>\s$/, schema.nodes.blockquote),
@@ -283,46 +282,79 @@ function buildKeymap() {
 
 const $ = (id) => document.getElementById(id);
 const els = {
-  docList: $("doc-list"), newDoc: $("new-doc"), title: $("doc-title"),
-  presence: $("presence"), translating: $("translating"), cost: $("cost"),
+  landing: $("view-landing"), setup: $("view-setup"), editorView: $("view-editor"),
+  signIn: $("sign-in"), landingOpen: $("landing-open"), landingUrl: $("landing-url"),
+  recentList: $("recent-list"), landingStatus: $("landing-status"),
+  setupLang: $("setup-lang"), setupKey: $("setup-key"), setupGo: $("setup-go"),
+  setupStatus: $("setup-status"), setupDocName: $("setup-doc-name"),
+  docName: $("doc-name"), openInDocs: $("open-in-docs"), share: $("share"),
+  cost: $("cost"), translating: $("translating"), syncDot: $("sync-dot"), syncText: $("sync-text"),
   langSelect: $("lang-select"), addLang: $("add-lang"),
   addLangPanel: $("add-lang-panel"), addLangInput: $("add-lang-input"),
   addLangConfirm: $("add-lang-confirm"), addLangCancel: $("add-lang-cancel"),
-  langCatalog: $("lang-catalog"), exportPdf: $("export-pdf"),
+  langCatalog: $("lang-catalog"),
   editorMount: $("editor"), editorScroll: $("editor-scroll"),
-  emptyState: $("empty-state"), emptyCreate: $("empty-create"),
-  connDot: $("conn-dot"), connText: $("conn-text"), toast: $("toast"),
-  toolbar: $("toolbar"),
+  toast: $("toast"), toolbar: $("toolbar"), readonly: $("readonly-note"),
 };
 
 let view = null;
-let ws = null;
-let currentDoc = null;          // {id, title, languages}
-let lang = localStorage.getItem("babbel-lang") || "en";
-let lastReceived = new Map();   // block id -> {html, sig} the server has for our lang
-
-const sigOf = (b) => `${b.type}|${JSON.stringify(b.attrs || {})}`;
+let docId = null;
+let docName = "";
+let canEdit = false;
+let lang = null;
+let model = null;              // parsed babel:meta JSON — the canonical document model
+let docSnapshot = null;        // last fetched documents.get result
+let lastVersion = null;        // Drive file version we've already pulled
+let lastReceived = new Map();  // block id -> {html, sig} last rendered for our lang
 let sendTimer = null;
 let applyingRemote = false;
 let skippedRemote = false;
-let reconnectTimer = null;
-let catalog = [];
+let pollTimer = null;
+let writeChain = Promise.resolve();
+let writing = false;
+const clientId = newId();
+const translateTimers = new Map(); // blockId -> timeout
+const heldLocks = new Map();       // blockId -> commentId
 
-function updateCost(usage) {
-  if (!usage) { els.cost.hidden = true; return; }
-  els.cost.hidden = false;
-  els.cost.textContent = `$${usage.cost_usd.toFixed(4)}`;
-  els.cost.title = `Claude translation cost for this document\n` +
-    `${usage.calls} API calls · ${usage.input_tokens.toLocaleString()} input / ` +
-    `${usage.output_tokens.toLocaleString()} output tokens`;
-}
+const sigOf = (b) => `${b.type}|${JSON.stringify(b.attrs || {})}`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const langName = (code) => model?.languages.find((l) => l.code === code)?.name || code;
+const langTab = (code) => {
+  const entry = model?.languages.find((l) => l.code === code);
+  return entry && docSnapshot ? D.tabById(docSnapshot, entry.tabId) : null;
+};
 
 function toast(message, isError = false) {
   els.toast.textContent = message;
   els.toast.className = isError ? "error" : "";
   els.toast.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { els.toast.hidden = true; }, 3500);
+  toast.timer = setTimeout(() => { els.toast.hidden = true; }, 4000);
+}
+
+function setSync(state, text) {
+  els.syncDot.className = `dot ${state}`;
+  els.syncText.textContent = text;
+}
+
+function showView(name) {
+  els.landing.hidden = name !== "landing";
+  els.setup.hidden = name !== "setup";
+  els.editorView.hidden = name !== "editor";
+}
+
+function updateCost() {
+  const u = model?.usage;
+  if (!u || !u.calls) { els.cost.hidden = true; return; }
+  els.cost.hidden = false;
+  els.cost.textContent = `$${u.cost_usd.toFixed(4)}`;
+  els.cost.title = `Claude translation cost for this document\n` +
+    `${u.calls} API calls · ${u.input_tokens.toLocaleString()} input / ` +
+    `${u.output_tokens.toLocaleString()} output tokens`;
+}
+
+function updateTranslating() {
+  els.translating.hidden = !model?.blocks.some((b) => b.pending?.length);
 }
 
 // --- Editor ----------------------------------------------------------------------
@@ -338,6 +370,7 @@ function createEditor() {
   });
   view = new EditorView(els.editorMount, {
     state,
+    editable: () => canEdit,
     dispatchTransaction(tr) {
       const newState = view.state.apply(tr);
       view.updateState(newState);
@@ -350,23 +383,25 @@ function createEditor() {
 
 function scheduleSend() {
   clearTimeout(sendTimer);
-  sendTimer = setTimeout(sendUpdate, 250);
+  sendTimer = setTimeout(sendUpdate, 400);
 }
 
-function hasUnsentChanges() {
-  return sendTimer !== null;
+const hasUnsentChanges = () => sendTimer !== null;
+
+function flushPendingSend() {
+  if (sendTimer) { clearTimeout(sendTimer); sendUpdate(); }
 }
 
 function sendUpdate() {
   sendTimer = null;
-  if (!ws || ws.readyState !== WebSocket.OPEN || !view) return;
+  if (!view || !model || !canEdit) return;
   const blocks = docToBlocks(view.state.doc);
   let changed = false;
   const payload = blocks.map((b) => {
     const prev = lastReceived.get(b.id);
     const sig = sigOf(b);
     if (prev && prev.html === b.html) {
-      // Text untouched: omit html so the server keeps all translations, but
+      // Text untouched: omit html so the merge keeps all translations, but
       // type/attrs changes (heading toggle, list indent) still count as edits.
       if (prev.sig !== sig) changed = true;
       prev.sig = sig;
@@ -377,13 +412,36 @@ function sendUpdate() {
     return b;
   });
   const removed = lastReceived.size !== blocks.length;
-  if (changed || removed || skippedRemote) {
-    skippedRemote = false;
-    ws.send(JSON.stringify({ type: "update", lang, blocks: payload }));
-    // Rebuild lastReceived to drop deleted blocks.
-    const ids = new Set(blocks.map((b) => b.id));
-    for (const id of [...lastReceived.keys()]) if (!ids.has(id)) lastReceived.delete(id);
-  }
+  if (!(changed || removed || skippedRemote)) return;
+  skippedRemote = false;
+  const ids = new Set(blocks.map((b) => b.id));
+  for (const id of [...lastReceived.keys()]) if (!ids.has(id)) lastReceived.delete(id);
+
+  const beforeOrder = model.blocks.map((b) => b.id).join(",");
+  const beforeSigs = new Map(model.blocks.map((b) => [b.id, sigOf(b)]));
+  const dirty = mergeBlocks(model, payload, lang);
+  // Type/attr changes (heading toggle, list indent) and reorders show in every
+  // language tab, so they force a full rewrite of all of them; plain text
+  // edits only rewrite the changed blocks in our own tab.
+  const structureChanged =
+    model.blocks.map((b) => b.id).join(",") !== beforeOrder ||
+    model.blocks.some((b) => beforeSigs.has(b.id) && beforeSigs.get(b.id) !== sigOf(b));
+  applyLocalModel();
+  const plans = {};
+  if (structureChanged) for (const l of model.languages) plans[l.code] = "full";
+  else plans[lang] = new Set(dirty);
+  queueWrite(plans, true);
+  for (const id of dirty) scheduleTranslate(id);
+}
+
+function applyLocalModel() {
+  // Refresh pending highlights + cost from the local model without touching text.
+  if (!view) return;
+  const rendered = renderBlocks(model, lang);
+  const pending = new Map(rendered.map((b) => [b.id, !!b.pending]));
+  view.dispatch(view.state.tr.setMeta(pendingKey, pending));
+  updateTranslating();
+  updateCost();
 }
 
 function applyRemote(blocks) {
@@ -397,7 +455,6 @@ function applyRemote(blocks) {
   applyingRemote = true;
   try {
     if (!newDoc.eq(view.state.doc)) {
-      // Remember the selection as (block id, offset into block).
       const { head } = view.state.selection;
       const $head = view.state.doc.resolve(head);
       let anchorId = null, offset = 0;
@@ -427,7 +484,7 @@ function applyRemote(blocks) {
   } finally {
     applyingRemote = false;
   }
-  els.translating.hidden = ![...pending.values()].some(Boolean);
+  updateTranslating();
 }
 
 // --- Toolbar -----------------------------------------------------------------------
@@ -502,9 +559,7 @@ async function copyMarkdown() {
 
 function insertMarkdown(text) {
   const parsed = mdParser.parse(text);
-  view.dispatch(view.state.tr
-    .replaceSelection(new Slice(parsed.content, 0, 0))
-    .scrollIntoView());
+  view.dispatch(view.state.tr.replaceSelection(new Slice(parsed.content, 0, 0)).scrollIntoView());
 }
 
 async function pasteMarkdown() {
@@ -553,147 +608,267 @@ els.toolbar.addEventListener("mousedown", (e) => {
   view?.focus();
 });
 
-// --- WebSocket sync -------------------------------------------------------------------
+// --- Google Docs sync ---------------------------------------------------------------
 
-function setConn(state) {
-  els.connDot.className = `dot ${state === "on" ? "on" : state === "off" ? "off" : ""}`;
-  els.connText.textContent = state === "on" ? "Connected" : state === "off" ? "Reconnecting…" : "Connecting…";
+async function refreshSnapshot() {
+  docSnapshot = await G.getDocument(docId);
+  const meta = await G.getFileMeta(docId);
+  lastVersion = meta.version;
+  docName = meta.name;
+  els.docName.textContent = docName;
 }
 
-function connect(docId) {
-  if (ws) { ws.onclose = null; ws.close(); ws = null; }
-  clearTimeout(reconnectTimer);
-  setConn("connecting");
-
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const connLang = lang;
-  ws = new WebSocket(`${proto}://${location.host}/ws/${docId}?lang=${encodeURIComponent(connLang)}`);
-
-  ws.onopen = () => setConn("on");
-
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === "init") {
-      currentDoc = { ...currentDoc, title: msg.title, languages: msg.languages };
-      els.title.value = msg.title;
-      renderLangSelect();
-      lastReceived = new Map();
-      updateCost(msg.usage);
-      applyRemote(msg.blocks);
-      // renderLangSelect may have fallen back if the remembered language
-      // isn't one of this document's languages.
-      if (lang !== connLang) ws.send(JSON.stringify({ type: "lang", lang }));
-    } else if (msg.type === "doc") {
-      applyRemote(msg.blocks);
-    } else if (msg.type === "meta") {
-      currentDoc = { ...currentDoc, title: msg.title, languages: msg.languages };
-      if (document.activeElement !== els.title) els.title.value = msg.title;
-      renderLangSelect();
-      loadDocList();
-    } else if (msg.type === "presence") {
-      const parts = Object.entries(msg.users).map(([code, n]) => `${n} ${code}`);
-      const total = Object.values(msg.users).reduce((a, b) => a + b, 0);
-      els.presence.textContent = total > 1 ? `${total} online (${parts.join(", ")})` : "";
-    } else if (msg.type === "usage") {
-      updateCost(msg.usage);
-    } else if (msg.type === "error") {
-      toast(msg.message, true);
-    } else if (msg.type === "deleted") {
-      toast("This document was deleted");
-      currentDoc = null;
-      ws.onclose = null; ws.close(); ws = null;
-      loadDocList().then(openFirstDoc);
+function queueWrite(tabPlans, metaChanged) {
+  // tabPlans: {langCode: "full" | Set(blockIds)}; serialized so concurrent
+  // edits/translations never compute indices against a stale snapshot.
+  writeChain = writeChain.then(async () => {
+    if (!model) return;
+    writing = true;
+    setSync("busy", "Saving…");
+    try {
+      const requests = [];
+      for (const [code, plan] of Object.entries(tabPlans || {})) {
+        const tab = langTab(code);
+        if (!tab) continue;
+        const rendered = renderBlocks(model, code);
+        if (plan === "full") {
+          requests.push(...D.fullTabRewriteRequests(tab, rendered));
+        } else {
+          const { spans } = D.parseLanguageTab(tab);
+          const targets = rendered
+            .filter((b) => plan.has(b.id) && spans.has(b.id))
+            .sort((a, b) => spans.get(b.id)[0] - spans.get(a.id)[0]); // bottom-up
+          const missing = [...plan].some((id) => !spans.get(id) && rendered.some((b) => b.id === id));
+          if (missing) {
+            requests.push(...D.fullTabRewriteRequests(tab, rendered));
+          } else {
+            for (const b of targets) {
+              requests.push(...D.singleBlockRewriteRequests(tab, b, spans.get(b.id)));
+            }
+          }
+        }
+      }
+      if (metaChanged) {
+        const metaTab = D.findMetaTab(docSnapshot);
+        if (metaTab) requests.push(...D.metaRewriteRequests(metaTab, model));
+      }
+      if (requests.length) {
+        await G.batchUpdate(docId, requests);
+        await refreshSnapshot();
+      }
+      setSync("on", "Synced");
+    } catch (err) {
+      console.error(err);
+      setSync("off", "Save failed");
+      toast(`Save failed: ${err.message}`, true);
+      // Re-pull on next poll so we converge with whatever is in the doc.
+      lastVersion = null;
+    } finally {
+      writing = false;
     }
-  };
-
-  ws.onclose = () => {
-    setConn("off");
-    reconnectTimer = setTimeout(() => currentDoc && connect(currentDoc.id), 1500);
-  };
-}
-
-// --- Documents sidebar ---------------------------------------------------------------
-
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
   });
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
-  return res.json();
+  return writeChain;
 }
 
-async function loadDocList() {
-  const docs = await api("/api/docs");
-  els.docList.innerHTML = "";
-  for (const doc of docs) {
-    const li = document.createElement("li");
-    li.classList.toggle("active", currentDoc?.id === doc.id);
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = doc.title;
-    const del = document.createElement("button");
-    del.className = "del";
-    del.textContent = "✕";
-    del.title = "Delete document";
-    del.onclick = async (e) => {
-      e.stopPropagation();
-      if (!confirm(`Delete "${doc.title}"?`)) return;
-      await api(`/api/docs/${doc.id}`, { method: "DELETE" });
-      if (currentDoc?.id === doc.id) currentDoc = null;
-      await loadDocList();
-      if (!currentDoc) openFirstDoc();
-    };
-    li.append(name, del);
-    li.onclick = () => openDoc(doc.id);
-    els.docList.appendChild(li);
+async function pullDoc() {
+  const doc = await G.getDocument(docId);
+  docSnapshot = doc;
+  const metaTab = D.findMetaTab(doc);
+  const meta = metaTab ? D.parseMeta(metaTab) : null;
+  if (!meta) { enterSetup(doc); return; }
+  model = meta;
+  model.usage = model.usage || { input_tokens: 0, output_tokens: 0, calls: 0, cost_usd: 0 };
+
+  if (!model.languages.some((l) => l.code === lang)) {
+    lang = model.languages[0]?.code;
+    updateLangSelect();
   }
-  return docs;
+
+  // Detect edits made directly in Google Docs (or half-written by a client
+  // that died): any language tab whose text differs from the model.
+  const editsByLang = new Map();
+  for (const l of model.languages) {
+    const tab = D.tabById(doc, l.tabId);
+    if (!tab) continue;
+    const parsed = D.parseLanguageTab(tab);
+    const rendered = renderBlocks(model, l.code);
+    const renderedById = new Map(rendered.map((b) => [b.id, b]));
+    let differs = parsed.blocks.length !== rendered.length || parsed.blocks.some((b) => !b.id);
+    const incoming = parsed.blocks.map((b, i) => {
+      const id = b.id || newId();
+      const known = b.id ? renderedById.get(b.id) : null;
+      if (known && known.html === b.html) {
+        if (rendered[i]?.id !== b.id || sigOf(known) !== sigOf(b)) differs = true;
+        return { id, type: b.type, attrs: b.attrs };
+      }
+      differs = true;
+      return { id, type: b.type, attrs: b.attrs, html: b.html };
+    });
+    if (differs) editsByLang.set(l.code, incoming);
+  }
+
+  const dirtyIds = [];
+  for (const [code, incoming] of editsByLang) {
+    dirtyIds.push(...mergeBlocks(model, incoming, code));
+  }
+  if (editsByLang.size && canEdit) {
+    // Normalize every language tab: external edits may have reordered or
+    // retyped blocks, which must be reflected everywhere, and the edited tab
+    // needs its named ranges re-registered.
+    const rewrites = {};
+    for (const l of model.languages) rewrites[l.code] = "full";
+    queueWrite(rewrites, true);
+    for (const id of dirtyIds) scheduleTranslate(id);
+  }
+  // Blocks still pending from an earlier session: pick them up (with locks).
+  if (canEdit && model.apiKey) {
+    for (const b of model.blocks) if (b.pending?.length) scheduleTranslate(b.id);
+  }
+
+  applyRemote(renderBlocks(model, lang));
+  updateLangSelect();
+  updateCost();
+  updateTranslating();
 }
 
-function openDoc(docId) {
-  if (currentDoc?.id === docId) return;
-  clearTimeout(sendTimer); sendTimer = null;
-  currentDoc = { id: docId };
-  updateCost(null);
-  localStorage.setItem("babbel-doc", docId);
-  els.emptyState.hidden = true;
-  els.editorScroll.hidden = false;
-  if (!view) createEditor();
-  connect(docId);
-  loadDocList();
+async function pollLoop() {
+  clearTimeout(pollTimer);
+  try {
+    if (!writing) {
+      const meta = await G.getFileMeta(docId);
+      if (meta.version !== lastVersion) {
+        lastVersion = meta.version;
+        docName = meta.name;
+        els.docName.textContent = docName;
+        await pullDoc();
+      }
+      setSync("on", "Synced");
+    }
+  } catch (err) {
+    console.error(err);
+    setSync("off", "Reconnecting…");
+  }
+  pollTimer = setTimeout(pollLoop, 500);
 }
 
-async function openFirstDoc() {
-  const docs = await api("/api/docs");
-  if (docs.length) {
-    openDoc(docs[0].id);
-  } else {
-    els.emptyState.hidden = false;
-    els.editorScroll.hidden = true;
+// --- Locks (Drive comments) -----------------------------------------------------------
+
+const LOCK_PREFIX = "[babel-lock]";
+const LOCK_TTL_MS = 2 * 60 * 1000;
+
+function parseLock(comment) {
+  if (!comment.content?.startsWith(LOCK_PREFIX)) return null;
+  try {
+    const data = JSON.parse(comment.content.slice(LOCK_PREFIX.length));
+    return { ...data, commentId: comment.id, createdTime: Date.parse(comment.createdTime) };
+  } catch {
+    return null;
   }
 }
 
-async function createDoc() {
-  const doc = await api("/api/docs", { method: "POST", body: JSON.stringify({ title: "Untitled" }) });
-  await loadDocList();
-  openDoc(doc.id);
-  els.title.focus();
-  els.title.select();
+async function acquireLock(blockId) {
+  // Create our lock comment, then look: if someone else's fresh lock on the
+  // same block predates ours, back off. Human comments are never touched.
+  const body = LOCK_PREFIX + JSON.stringify({ b: blockId, c: clientId, t: Date.now() });
+  const created = await G.createComment(docId, body);
+  const mineTime = Date.parse(created.createdTime);
+  const comments = await G.listComments(docId);
+  const locks = comments.map(parseLock).filter((l) => l && l.b === blockId);
+  for (const l of locks) {
+    const age = Date.now() - l.createdTime;
+    if (l.c !== clientId && age < LOCK_TTL_MS && l.createdTime <= mineTime && l.commentId !== created.id) {
+      await G.deleteComment(docId, created.id);
+      return false;
+    }
+    if (l.c === clientId && l.commentId !== created.id) {
+      await G.deleteComment(docId, l.commentId); // our own stale lock
+    }
+  }
+  heldLocks.set(blockId, created.id);
+  return true;
 }
 
-// --- Languages -------------------------------------------------------------------------
+async function releaseLock(blockId) {
+  const commentId = heldLocks.get(blockId);
+  heldLocks.delete(blockId);
+  if (commentId) await G.deleteComment(docId, commentId).catch(() => {});
+}
 
-function renderLangSelect() {
+// --- Translation ------------------------------------------------------------------------
+
+function scheduleTranslate(blockId) {
+  if (!canEdit) return;
+  if (!model?.apiKey) { toast("No Anthropic API key in babel:meta — translations are paused", true); return; }
+  clearTimeout(translateTimers.get(blockId));
+  translateTimers.set(blockId, setTimeout(() => {
+    translateTimers.delete(blockId);
+    translateBlock(blockId).catch((err) => {
+      console.error(err);
+      toast(`Translation failed: ${err.message}`, true);
+    });
+  }, 1000));
+}
+
+async function translateBlock(blockId) {
+  const block = model?.blocks.find((b) => b.id === blockId);
+  if (!block || !block.pending?.length) return;
+  if (!(await acquireLock(blockId))) return; // another client is on it
+  try {
+    const source = block.source;
+    const sourceHtml = block.content[source];
+    const targets = [...block.pending];
+    const context = blockContext(model, blockId, source);
+    const spent = { input: 0, output: 0, calls: 0 };
+    const cfg = { apiKey: model.apiKey, model: model.model || T.DEFAULT_MODEL };
+
+    const results = await Promise.allSettled(targets.map((t) =>
+      T.translateBlockTo(cfg, sourceHtml, block.prev_html, block.content[t],
+        langName(source), langName(t), context, spent)));
+
+    // Record cost even if the result ends up discarded below.
+    model.usage.input_tokens += spent.input;
+    model.usage.output_tokens += spent.output;
+    model.usage.calls += spent.calls;
+    model.usage.cost_usd += T.costOf(cfg.model, spent.input, spent.output);
+
+    // Re-check: the block may have been re-edited meanwhile.
+    const cur = model.blocks.find((b) => b.id === blockId);
+    if (!cur || cur.content[cur.source] !== sourceHtml) {
+      queueWrite({}, true);
+      updateCost();
+      return;
+    }
+    const errors = [];
+    const changedTabs = {};
+    targets.forEach((t, i) => {
+      const r = results[i];
+      if (r.status === "rejected") {
+        errors.push(`${langName(t)}: ${r.reason?.message || r.reason}`);
+      } else {
+        cur.content[t] = sanitizeInlineHtml(r.value);
+        cur.pending = (cur.pending || []).filter((p) => p !== t);
+        changedTabs[t] = new Set([blockId]);
+      }
+    });
+    if (!cur.pending?.length) delete cur.prev_html;
+    queueWrite(changedTabs, true);
+    if (lang !== cur.source) applyRemote(renderBlocks(model, lang));
+    applyLocalModel();
+    if (errors.length) toast(`Some translations failed and will retry on the next edit (${errors[0]})`, true);
+  } finally {
+    await releaseLock(blockId);
+  }
+}
+
+// --- Languages ------------------------------------------------------------------------------
+
+function updateLangSelect() {
   els.langSelect.innerHTML = "";
-  for (const l of currentDoc?.languages || []) {
+  for (const l of model?.languages || []) {
     const opt = document.createElement("option");
     opt.value = l.code;
     opt.textContent = l.name;
     els.langSelect.appendChild(opt);
-  }
-  if (![...els.langSelect.options].some((o) => o.value === lang)) {
-    lang = currentDoc?.languages?.[0]?.code || "en";
   }
   els.langSelect.value = lang;
 }
@@ -701,23 +876,17 @@ function renderLangSelect() {
 els.langSelect.onchange = () => {
   flushPendingSend();
   lang = els.langSelect.value;
-  localStorage.setItem("babbel-lang", lang);
+  localStorage.setItem(`babel-lang-${docId}`, lang);
+  const url = new URL(location.href);
+  url.searchParams.set("lang", lang);
+  history.replaceState(null, "", url);
   lastReceived = new Map();
-  ws?.send(JSON.stringify({ type: "lang", lang }));
+  applyRemote(renderBlocks(model, lang));
 };
 
-function flushPendingSend() {
-  if (sendTimer) { clearTimeout(sendTimer); sendUpdate(); }
-}
-
-els.addLang.onclick = async () => {
+els.addLang.onclick = () => {
   els.addLangPanel.hidden = !els.addLangPanel.hidden;
   if (!els.addLangPanel.hidden) {
-    if (!catalog.length) {
-      catalog = await api("/api/languages");
-      els.langCatalog.innerHTML = catalog
-        .map((l) => `<option value="${l.name}">${l.code}</option>`).join("");
-    }
     els.addLangInput.value = "";
     els.addLangInput.focus();
   }
@@ -728,47 +897,226 @@ els.addLangInput.onkeydown = (e) => { if (e.key === "Enter") addLanguage(); };
 
 async function addLanguage() {
   const raw = els.addLangInput.value.trim();
-  if (!raw || !currentDoc) return;
-  let entry = catalog.find((l) => l.name.toLowerCase() === raw.toLowerCase() || l.code === raw.toLowerCase());
-  const body = entry || { code: raw.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 8), name: raw };
+  if (!raw || !model || !canEdit) return;
+  const entry = LANGUAGE_CATALOG.find(
+    (l) => l.name.toLowerCase() === raw.toLowerCase() || l.code === raw.toLowerCase());
+  const code = entry?.code || raw.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 8);
+  const name = entry?.name || raw;
+  if (!code || !name) return;
+  if (model.languages.some((l) => l.code === code)) { toast("Language already added", true); return; }
+  els.addLangPanel.hidden = true;
+  toast(`Adding ${name}…`);
+
+  const dirty = [];
+  writeChain = writeChain.then(async () => {
+    writing = true;
+    try {
+      const tabId = await G.addTab(docId, name);
+      await refreshSnapshot();
+      model.languages.push({ code, name, tabId });
+      for (const b of model.blocks) {
+        if (b.type === "code" || !stripTags(b.content[b.source] || "").trim()) {
+          b.content[code] = b.content[b.source] || "";
+        } else if (!(code in b.content)) {
+          b.pending = b.pending || [];
+          if (!b.pending.includes(code)) b.pending.push(code);
+          dirty.push(b.id);
+        }
+      }
+      const tab = D.tabById(docSnapshot, tabId);
+      const requests = [
+        ...D.fullTabRewriteRequests(tab, renderBlocks(model, code)),
+        ...D.metaRewriteRequests(D.findMetaTab(docSnapshot), model),
+      ];
+      await G.batchUpdate(docId, requests);
+      await refreshSnapshot();
+    } finally {
+      writing = false;
+    }
+  }).then(() => {
+    updateLangSelect();
+    applyLocalModel();
+    toast(`Added ${name} — translating existing content…`);
+    dirty.forEach((id, i) => setTimeout(() => scheduleTranslate(id), i * 400));
+  }).catch((err) => {
+    toast(`Couldn't add language: ${err.message}`, true);
+  });
+}
+
+// --- Setup (no babel:meta tab yet) --------------------------------------------------------------
+
+function enterSetup(doc) {
+  clearTimeout(pollTimer);
+  if (!canEdit) {
+    showView("landing");
+    els.landingStatus.textContent =
+      "This document isn't set up for Babbel Docs yet, and you don't have edit access to set it up.";
+    return;
+  }
+  showView("setup");
+  els.setupDocName.textContent = docName || "this document";
+  els.setupLang.value = els.setupLang.value || "English";
+}
+
+els.setupGo.onclick = async () => {
+  const raw = els.setupLang.value.trim() || "English";
+  const entry = LANGUAGE_CATALOG.find(
+    (l) => l.name.toLowerCase() === raw.toLowerCase() || l.code === raw.toLowerCase());
+  const code = entry?.code || raw.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 8);
+  const name = entry?.name || raw;
+  const apiKey = els.setupKey.value.trim();
+  if (!apiKey.startsWith("sk-ant-")) {
+    els.setupStatus.textContent = "That doesn't look like an Anthropic API key (sk-ant-…).";
+    return;
+  }
+  els.setupGo.disabled = true;
+  els.setupStatus.textContent = "Checking API key…";
   try {
-    await api(`/api/docs/${currentDoc.id}/languages`, { method: "POST", body: JSON.stringify(body) });
-    els.addLangPanel.hidden = true;
-    toast(`Added ${body.name} — translating existing content…`);
+    await T.verifyApiKey(apiKey);
+    els.setupStatus.textContent = "Setting up document tabs…";
+    const doc = await G.getDocument(docId);
+    const firstTab = D.flattenTabs(doc)[0];
+    const parsed = D.parseLanguageTab(firstTab);
+    const blocks = parsed.blocks.map((b) => ({
+      id: b.id || newId(),
+      type: b.type,
+      attrs: b.attrs,
+      content: { [code]: sanitizeInlineHtml(b.html) },
+      source: code,
+      pending: [],
+    }));
+    model = {
+      babel: 1,
+      model: T.DEFAULT_MODEL,
+      apiKey,
+      languages: [{ code, name, tabId: firstTab.tabProperties.tabId }],
+      usage: { input_tokens: 0, output_tokens: 0, calls: 0, cost_usd: 0 },
+      blocks,
+    };
+    const metaTabId = await G.addTab(docId, D.META_TAB_TITLE);
+    const fresh = await G.getDocument(docId);
+    const langTabFresh = D.tabById(fresh, firstTab.tabProperties.tabId);
+    const metaTabFresh = D.tabById(fresh, metaTabId);
+    await G.batchUpdate(docId, [
+      { updateDocumentTabProperties: {
+        tabProperties: { tabId: firstTab.tabProperties.tabId, title: name }, fields: "title" } },
+      ...D.fullTabRewriteRequests(langTabFresh, renderBlocks(model, code)),
+      ...D.metaRewriteRequests(metaTabFresh, model),
+    ]);
+    lang = code;
+    await enterEditor();
   } catch (err) {
-    toast(err.message, true);
+    console.error(err);
+    els.setupStatus.textContent = `Setup failed: ${err.message}`;
+  } finally {
+    els.setupGo.disabled = false;
+  }
+};
+
+// --- Landing / boot ----------------------------------------------------------------------------------
+
+function recentDocs() {
+  try { return JSON.parse(localStorage.getItem("babel-recent") || "[]"); } catch { return []; }
+}
+
+function rememberDoc(id, name) {
+  const list = recentDocs().filter((d) => d.id !== id);
+  list.unshift({ id, name, at: Date.now() });
+  localStorage.setItem("babel-recent", JSON.stringify(list.slice(0, 12)));
+}
+
+function renderRecent() {
+  const docs = recentDocs();
+  els.recentList.innerHTML = "";
+  els.recentList.hidden = !docs.length;
+  for (const d of docs) {
+    const li = document.createElement("li");
+    li.textContent = d.name || d.id;
+    li.onclick = () => openDoc(d.id);
+    els.recentList.appendChild(li);
   }
 }
 
-// --- Misc UI -----------------------------------------------------------------------------
+async function openDoc(id) {
+  docId = id;
+  els.landingStatus.textContent = "Opening document…";
+  try {
+    const meta = await G.getFileMeta(docId);
+    docName = meta.name;
+    canEdit = !!meta.capabilities?.canEdit;
+    lastVersion = meta.version;
+    rememberDoc(docId, docName);
+    const url = new URL(location.href);
+    url.searchParams.set("doc", docId);
+    history.replaceState(null, "", url);
+    lang = new URL(location.href).searchParams.get("lang") ||
+      localStorage.getItem(`babel-lang-${docId}`) || null;
+    await enterEditor();
+  } catch (err) {
+    console.error(err);
+    els.landingStatus.textContent = `Couldn't open document: ${err.message}`;
+  }
+}
 
-els.newDoc.onclick = createDoc;
-els.emptyCreate.onclick = createDoc;
+async function enterEditor() {
+  showView("editor");
+  els.docName.textContent = docName;
+  els.openInDocs.href = `https://docs.google.com/document/d/${docId}/edit`;
+  els.readonly.hidden = canEdit;
+  if (!view) createEditor();
+  lastReceived = new Map();
+  await pullDoc();
+  if (model) {
+    if (!lang || !model.languages.some((l) => l.code === lang)) lang = model.languages[0]?.code;
+    updateLangSelect();
+    applyRemote(renderBlocks(model, lang));
+    pollLoop();
+  }
+}
 
-let titleTimer = null;
-els.title.addEventListener("input", () => {
-  clearTimeout(titleTimer);
-  titleTimer = setTimeout(() => {
-    ws?.send(JSON.stringify({ type: "title", title: els.title.value }));
-    loadDocList();
-  }, 400);
-});
-
-els.exportPdf.onclick = () => {
-  if (!currentDoc) return;
-  flushPendingSend();
-  window.open(`/api/docs/${currentDoc.id}/export.pdf?lang=${encodeURIComponent(lang)}`, "_blank");
+els.share.onclick = async () => {
+  const url = `${location.origin}${location.pathname}?doc=${docId}&lang=${encodeURIComponent(lang)}`;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("Link copied — anyone with access to the Google Doc can open it");
+  } catch {
+    prompt("Share this link:", url);
+  }
 };
 
-// Console/debug access to the markdown converters.
-window.babbel = { toMarkdown: () => mdSerializer.serialize(view.state.doc), insertMarkdown };
+els.landingOpen.onclick = () => {
+  const id = G.extractDocId(els.landingUrl.value);
+  if (!id) { els.landingStatus.textContent = "Paste a Google Docs URL (docs.google.com/document/d/…)"; return; }
+  openDoc(id);
+};
+els.landingUrl.onkeydown = (e) => { if (e.key === "Enter") els.landingOpen.onclick(); };
 
-// --- Boot --------------------------------------------------------------------------------
+els.signIn.onclick = async () => {
+  try {
+    els.landingStatus.textContent = "Signing in…";
+    await G.signIn();
+    els.signIn.hidden = true;
+    els.landingStatus.textContent = "";
+    document.getElementById("landing-open-row").hidden = false;
+    renderRecent();
+    const params = new URL(location.href).searchParams;
+    const fromUrl = G.extractDocId(params.get("doc") || "");
+    if (fromUrl) openDoc(fromUrl);
+  } catch (err) {
+    els.landingStatus.textContent = `Sign-in failed: ${err.message}`;
+  }
+};
 
 (async function boot() {
-  const docs = await loadDocList();
-  const remembered = localStorage.getItem("babbel-doc");
-  if (remembered && docs.some((d) => d.id === remembered)) openDoc(remembered);
-  else if (docs.length) openDoc(docs[0].id);
-  else { els.emptyState.hidden = false; els.editorScroll.hidden = true; }
+  const datalist = document.getElementById("lang-catalog");
+  datalist.innerHTML = LANGUAGE_CATALOG.map((l) => `<option value="${l.name}">${l.code}</option>`).join("");
+  showView("landing");
+  try {
+    await G.initAuth();
+    els.signIn.disabled = false;
+  } catch (err) {
+    els.landingStatus.textContent = err.message;
+  }
 })();
+
+window.babbel = { toMarkdown: () => mdSerializer.serialize(view.state.doc), insertMarkdown };

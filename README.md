@@ -4,41 +4,68 @@ A collaborative rich-text editor with real-time translation. Everyone edits
 the same document in their own language; edited sentences are automatically
 retranslated into the document's other languages with Claude.
 
+**Frontend-only.** There is no server: a Google Doc is the database, and the
+app is a static page (host it on GitHub Pages). All Google API calls happen in
+the browser with the signed-in user's own OAuth token.
+
 | English view | Same document in Chinese |
 |---|---|
 | ![Editor, English](screenshots/editor-en.png) | ![Editor, Chinese](screenshots/editor-zh.png) |
 
-## Features
+## How it works
 
-- **Rich text** (ProseMirror): bold / italic / underline / strikethrough,
-  inline code, links, H1–H3, nested bullet & numbered lists, blockquotes,
-  code blocks. Markdown shortcuts while typing (`# `, `- `, `> `, ``` ``` ```).
+- **The Google Doc is the storage.** A tab named `babel:meta` holds a JSON
+  blob: the language list, the Anthropic API key, the translation cost
+  counters, and the canonical block model. One additional tab per language
+  holds the rendered, human-readable document — open the doc in Google Docs
+  and you can read every translation directly.
+- **Block identity** is tracked with Docs named ranges (`babel:<id>`), so
+  blocks keep their translations when text moves around. Edits made directly
+  in Google Docs are picked up too and retranslated.
 - **Sentence-level translation**: only the sentences you actually edited are
-  retranslated — the surrounding paragraph, its current translation, and the
-  neighboring blocks ride along as context. Formatting survives translation.
-- **Multiple documents**: sidebar to create, rename, switch, delete.
-- **Per-document languages**: starts with English / Polish / Mandarin; add any
-  language (catalog or custom) and existing content is translated into it.
-- **Markdown in & out**: "Copy MD" puts the whole document on the clipboard as
-  Markdown; "Paste MD" inserts clipboard Markdown at the cursor.
-- **PDF export** of whichever language you're viewing (WeasyPrint, CJK-ready).
-- **Cost counter**: live per-document Claude spend in the top bar (hover for
-  calls / token counts).
-- **Real-time presence** and yellow highlights on blocks awaiting translation.
+  retranslated (Claude Sonnet, called straight from the browser) — the
+  surrounding paragraph and neighboring blocks ride along as context.
+- **Coordination via comments**: while a client translates a block it holds a
+  `[babel-lock]` Drive comment on the file; other clients back off. Lock
+  comments are deleted when translation finishes (or expire after 2 minutes);
+  human comments are never touched.
+- **Sync** is polling: clients poll the Drive file version (~2×/s, cheap) and
+  refetch the doc only when it changed.
 
-## Run
+## Using it
 
-```bash
-./run.sh
-```
+1. Open the app and sign in with Google.
+2. Paste the URL of any Google Doc you can edit (or follow a shared link like
+   `…/?doc=DOC_ID&lang=pl`, which opens that document in that language).
+3. First time per document, the app walks you through setup: pick the language
+   of the existing content and paste an Anthropic API key.
+   **The key is stored inside the doc's `babel:meta` tab — anyone with read
+   access to the document can see and use it.** Use a key with a spend limit
+   and only share the doc with people you trust.
+4. Add languages with **+ lang** — a new tab is created and the whole document
+   is translated into it. Switch languages with the dropdown; edit in any of
+   them. The live Claude spend for the document shows in the top bar.
+5. **Share** copies a link that opens the doc in the current language (the
+   recipient signs in with their own Google account and needs access to the
+   doc itself). PDF export: use Google Docs (File → Download) on the language
+   tab you want.
 
-That creates the venv, installs dependencies, scaffolds `.env` (add your
-`ANTHROPIC_API_KEY`), and starts the server on http://localhost:8000.
-Open multiple tabs with different languages to see live translation.
+## Hosting / setup (one-time, for the person deploying)
 
-For Chinese PDF output install CJK fonts once: `sudo apt-get install fonts-noto-cjk`.
+The app is static — any static host works; GitHub Pages instructions:
 
-Optional env vars: `TRANSLATION_MODEL` (default `claude-sonnet-4-6`).
+1. Repo → Settings → Pages → deploy from branch `main`, root (`/`).
+2. Google Cloud Console (reusing an existing OAuth project is fine):
+   - Enable the **Google Docs API** and the **Google Drive API**.
+   - OAuth consent screen: add the scopes `…/auth/documents` and `…/auth/drive`.
+     For an External/unverified app, users see a "Google hasn't verified this
+     app" warning they click through once.
+   - Credentials → the OAuth 2.0 **Web application** Client ID: add the GitHub
+     Pages origin (e.g. `https://<user>.github.io`) to Authorized JavaScript
+     origins.
+   - Put the Client ID in `static/gdocs.js` (`CLIENT_ID`).
+
+No build step; `static/vendor/prosemirror.js` is a committed ESM bundle.
 
 ## Keyboard shortcuts
 
@@ -51,28 +78,20 @@ Optional env vars: `TRANSLATION_MODEL` (default `claude-sonnet-4-6`).
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | `# `, `## `, `- `, `1. `, `> `, ``` ``` ``` | Heading / list / quote / code block as you type |
 
-## How it works
+Plus **Copy MD** / **Paste MD** toolbar buttons for Markdown in and out.
+
+## Document model
 
 A document is a flat list of blocks (`paragraph | heading | list_item |
 blockquote | code`), each with a stable id and per-language inline-HTML
-content. Clients send their language's block list over a WebSocket; the server
-merges by block id, so unchanged, reordered, restyled, or re-indented blocks
-keep their translations. For an edited block the server diffs its sentences
-against the source text the existing translations were made from: unchanged
-sentences keep their translation, edited ones are retranslated (debounced,
-cancel-on-reedit). Code blocks and empty blocks are shared verbatim. Until a
-translation arrives, other-language readers see the source text highlighted.
+content. In the Google Doc, one block = one paragraph; headings map to Docs
+heading styles, lists to real Docs bullets (nesting included), blockquotes to
+indented paragraphs, code blocks to shaded Courier paragraphs, and `<br>` to
+soft line breaks. When a block is edited, the app diffs its sentences against
+the previous source text and sends only the changed sentences to Claude, with
+the paragraph and the existing translation as context, so formatting and the
+untouched sentences survive.
 
-Conflicts resolve last-write-wins per block; the most recent writer's language
-becomes that block's source language.
-
-## Files
-
-- `main.py` — FastAPI backend: REST (docs / languages / PDF), per-document
-  WebSocket rooms, block merge, sentence-diff translation pipeline.
-- `static/app.js` — frontend: ProseMirror editor, sidebar, toolbar, WS sync,
-  markdown conversion.
-- `static/vendor/prosemirror.js` — committed ProseMirror bundle (esbuild;
-  no runtime CDN dependency).
-- `docs/` — document storage, one JSON file per document (gitignored).
-- `tests/` — `pytest tests/ -q`.
+The previous self-hosted client/server version (FastAPI + WebSockets +
+WeasyPrint PDF export) lives on the [`hosted-server`](../../tree/hosted-server)
+branch.
