@@ -117,11 +117,16 @@ export function getRevisionId(docId) {
   return gfetch(`${DOCS}/documents/${docId}?fields=revisionId`).then((d) => d.revisionId);
 }
 
-export function batchUpdate(docId, requests) {
+export function batchUpdate(docId, requests, requiredRevisionId) {
+  // With requiredRevisionId set, the write is rejected if the document
+  // changed since that revision — the caller rebuilds against a fresh
+  // snapshot and retries instead of corrupting indices.
   if (!requests.length) return Promise.resolve({ replies: [] });
+  const body = { requests };
+  if (requiredRevisionId) body.writeControl = { requiredRevisionId };
   return gfetch(`${DOCS}/documents/${docId}:batchUpdate`, {
     method: "POST",
-    body: JSON.stringify({ requests }),
+    body: JSON.stringify(body),
   });
 }
 

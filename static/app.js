@@ -312,8 +312,11 @@ let sendTimer = null;
 let applyingRemote = false;
 let skippedRemote = false;
 let pollTimer = null;
+let lockTimer = null;
 let writeChain = Promise.resolve();
 let writing = false;
+let queuedWrites = 0;
+let lockedBlocks = new Set();      // block ids locked by other clients (being translated)
 const clientId = newId();
 const translateTimers = new Map(); // blockId -> timeout
 const heldLocks = new Map();       // blockId -> commentId
@@ -356,8 +359,13 @@ function updateCost() {
 }
 
 function updateTranslating() {
-  els.translating.hidden = !model?.blocks.some((b) => b.pending?.length);
+  els.translating.hidden = !(model?.blocks.some((b) => b.pending?.length) || lockedBlocks.size);
 }
+
+// Awaiting-translation (from meta) and being-translated-right-now (from lock
+// comments) blocks share the yellow highlight.
+const pendingMapOf = (blocks) =>
+  new Map(blocks.map((b) => [b.id, !!b.pending || lockedBlocks.has(b.id)]));
 
 // --- Editor ----------------------------------------------------------------------
 
@@ -385,7 +393,7 @@ function createEditor() {
 
 function scheduleSend() {
   clearTimeout(sendTimer);
-  sendTimer = setTimeout(sendUpdate, 400);
+  sendTimer = setTimeout(sendUpdate, 250);
 }
 
 const hasUnsentChanges = () => sendTimer !== null;
@@ -440,8 +448,7 @@ function applyLocalModel() {
   // Refresh pending highlights + cost from the local model without touching text.
   if (!view) return;
   const rendered = renderBlocks(model, lang);
-  const pending = new Map(rendered.map((b) => [b.id, !!b.pending]));
-  view.dispatch(view.state.tr.setMeta(pendingKey, pending));
+  view.dispatch(view.state.tr.setMeta(pendingKey, pendingMapOf(rendered)));
   updateTranslating();
   updateCost();
 }
@@ -451,7 +458,7 @@ function applyRemote(blocks) {
   if (hasUnsentChanges()) { skippedRemote = true; return; }
 
   lastReceived = new Map(blocks.map((b) => [b.id, { html: b.html, sig: sigOf(b) }]));
-  const pending = new Map(blocks.map((b) => [b.id, !!b.pending]));
+  const pending = pendingMapOf(blocks);
   const newDoc = blocksToDoc(blocks);
 
   applyingRemote = true;
@@ -621,43 +628,59 @@ async function refreshSnapshot() {
   els.docName.textContent = docName;
 }
 
+function buildWriteRequests(tabPlans, metaChanged) {
+  // tabPlans: {langCode: "full" | Set(blockIds)} — always built against the
+  // current docSnapshot, so indices match the revision we condition on.
+  const requests = [];
+  for (const [code, plan] of Object.entries(tabPlans || {})) {
+    const tab = langTab(code);
+    if (!tab) continue;
+    const rendered = renderBlocks(model, code);
+    if (plan === "full") {
+      requests.push(...D.fullTabRewriteRequests(tab, rendered));
+    } else {
+      const { spans } = D.parseLanguageTab(tab);
+      const targets = rendered
+        .filter((b) => plan.has(b.id) && spans.has(b.id))
+        .sort((a, b) => spans.get(b.id)[0] - spans.get(a.id)[0]); // bottom-up
+      const missing = [...plan].some((id) => !spans.get(id) && rendered.some((b) => b.id === id));
+      if (missing) {
+        requests.push(...D.fullTabRewriteRequests(tab, rendered));
+      } else {
+        for (const b of targets) {
+          requests.push(...D.singleBlockRewriteRequests(tab, b, spans.get(b.id)));
+        }
+      }
+    }
+  }
+  if (metaChanged) {
+    const metaTab = D.findMetaTab(docSnapshot);
+    if (metaTab) requests.push(...D.metaRewriteRequests(metaTab, model));
+  }
+  return requests;
+}
+
 function queueWrite(tabPlans, metaChanged) {
-  // tabPlans: {langCode: "full" | Set(blockIds)}; serialized so concurrent
-  // edits/translations never compute indices against a stale snapshot.
+  // Writes are serialized, conditioned on the snapshot's revisionId, and
+  // rebuilt from a fresh snapshot when another client wrote in between.
+  queuedWrites += 1;
   writeChain = writeChain.then(async () => {
     if (!model) return;
     writing = true;
     setSync("busy", "Saving…");
     try {
-      const requests = [];
-      for (const [code, plan] of Object.entries(tabPlans || {})) {
-        const tab = langTab(code);
-        if (!tab) continue;
-        const rendered = renderBlocks(model, code);
-        if (plan === "full") {
-          requests.push(...D.fullTabRewriteRequests(tab, rendered));
-        } else {
-          const { spans } = D.parseLanguageTab(tab);
-          const targets = rendered
-            .filter((b) => plan.has(b.id) && spans.has(b.id))
-            .sort((a, b) => spans.get(b.id)[0] - spans.get(a.id)[0]); // bottom-up
-          const missing = [...plan].some((id) => !spans.get(id) && rendered.some((b) => b.id === id));
-          if (missing) {
-            requests.push(...D.fullTabRewriteRequests(tab, rendered));
-          } else {
-            for (const b of targets) {
-              requests.push(...D.singleBlockRewriteRequests(tab, b, spans.get(b.id)));
-            }
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const requests = buildWriteRequests(tabPlans, metaChanged);
+          if (requests.length) {
+            await G.batchUpdate(docId, requests, docSnapshot.revisionId);
+            await refreshSnapshot();
           }
+          break;
+        } catch (err) {
+          if (attempt >= 2) throw err;
+          await refreshSnapshot(); // doc moved under us — rebuild and retry
         }
-      }
-      if (metaChanged) {
-        const metaTab = D.findMetaTab(docSnapshot);
-        if (metaTab) requests.push(...D.metaRewriteRequests(metaTab, model));
-      }
-      if (requests.length) {
-        await G.batchUpdate(docId, requests);
-        await refreshSnapshot();
       }
       setSync("on", "Synced");
     } catch (err) {
@@ -666,8 +689,10 @@ function queueWrite(tabPlans, metaChanged) {
       toast(`Save failed: ${err.message}`, true);
       // Re-pull on next poll so we converge with whatever is in the doc.
       lastVersion = null;
+      lastRevision = null;
     } finally {
       writing = false;
+      queuedWrites -= 1;
     }
   });
   return writeChain;
@@ -711,6 +736,11 @@ async function pullDoc() {
     if (differs) editsByLang.set(l.code, incoming);
   }
 
+  // Don't fold tab text back into the model while our own writes are still
+  // queued — the tabs would show pre-write text and clobber the local edit.
+  if (editsByLang.size && (queuedWrites || hasUnsentChanges())) {
+    return;
+  }
   const dirtyIds = [];
   for (const [code, incoming] of editsByLang) {
     dirtyIds.push(...mergeBlocks(model, incoming, code));
@@ -738,12 +768,12 @@ async function pullDoc() {
 async function pollLoop() {
   clearTimeout(pollTimer);
   try {
-    if (!writing && model) {
-      // Cheap Drive-version check every tick; every 4th tick also probe the
+    if (!writing && !queuedWrites && model) {
+      // Cheap Drive-version check every tick; every other tick also probe the
       // Docs revisionId, since Drive's version field can lag content changes.
       const meta = await G.getFileMeta(docId);
       let changed = meta.version !== lastVersion;
-      if (!changed && pollTick % 4 === 3) {
+      if (!changed && pollTick % 2 === 1) {
         changed = (await G.getRevisionId(docId)) !== lastRevision;
       }
       if (changed) {
@@ -767,6 +797,28 @@ async function pollLoop() {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && docId && model) pollLoop();
 });
+
+async function pollLocks() {
+  // Watch other clients' [babel-lock] comments so "being translated" blocks
+  // highlight everywhere, independent of the slower meta round-trip.
+  clearTimeout(lockTimer);
+  try {
+    if (model) {
+      const comments = await G.listComments(docId);
+      const now = Date.now();
+      const fresh = new Set(comments
+        .map(parseLock)
+        .filter((l) => l && l.c !== clientId && now - l.createdTime < LOCK_TTL_MS)
+        .map((l) => l.b));
+      const changed = fresh.size !== lockedBlocks.size || [...fresh].some((b) => !lockedBlocks.has(b));
+      lockedBlocks = fresh;
+      if (changed) applyLocalModel();
+    }
+  } catch (err) {
+    console.error(err);
+  }
+  lockTimer = setTimeout(pollLocks, 1500);
+}
 
 // --- Locks (Drive comments) -----------------------------------------------------------
 
@@ -1088,6 +1140,7 @@ async function enterEditor() {
     updateLangSelect();
     applyRemote(renderBlocks(model, lang));
     pollLoop();
+    pollLocks();
   }
 }
 
@@ -1137,6 +1190,8 @@ els.signIn.onclick = async () => {
 els.openOther.onclick = () => {
   // Leave the current document and go back to the landing page.
   clearTimeout(pollTimer);
+  clearTimeout(lockTimer);
+  lockedBlocks = new Set();
   clearTimeout(sendTimer);
   sendTimer = null;
   for (const t of translateTimers.values()) clearTimeout(t);
