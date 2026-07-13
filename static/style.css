@@ -124,9 +124,20 @@ body {
 .ProseMirror code { background: #f4f6f8; border-radius: 4px; padding: 1px 4px; font-size: .9em; }
 .ProseMirror ul, .ProseMirror ol { margin: 0 0 .55em; padding-left: 26px; }
 .ProseMirror a { color: #2563eb; }
+/* Incoming translation: this text is about to be replaced. */
 .ProseMirror .pending {
   background: #fef3c7; border-radius: 3px;
   transition: background .4s;
+}
+/* Outgoing translation: this text is being translated into other languages. */
+.ProseMirror .outgoing {
+  background: #dbeafe; border-radius: 3px;
+  transition: background .4s;
+}
+/* Placeholder where newly added text will appear once translated. */
+.ProseMirror .incoming-gap {
+  background: #fef3c7; border-radius: 3px; padding: 0 10px; margin: 0 2px;
+  animation: pulse 1.2s ease-in-out infinite;
 }
 
 #toast {

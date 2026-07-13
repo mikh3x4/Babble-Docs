@@ -146,6 +146,44 @@ export function diffOpcodes(a, b) {
   return merged;
 }
 
+export function diffSentenceIndices(prevHtml, newHtml) {
+  // Which sentences does an edit touch? Returns {n, d, ins} or null (no
+  // history => treat as whole-block):
+  //   n   - indices into the NEW source sentences being translated
+  //         (outgoing highlight in source-language views)
+  //   d   - indices into the OLD sentences being replaced/removed
+  //         (incoming highlight in target-language views, which still show
+  //         the old, aligned translation)
+  //   ins - old-sentence positions where NEW sentences are inserted
+  //         (blank-space placeholder in target-language views)
+  if (!prevHtml) return null;
+  const oldS = splitSentencesHtml(prevHtml);
+  const newS = splitSentencesHtml(newHtml || "");
+  const n = [], d = [], ins = [];
+  for (const [tag, i1, i2, j1, j2] of diffOpcodes(oldS, newS)) {
+    if (tag === "equal") continue;
+    for (let j = j1; j < j2; j++) n.push(j);
+    if (tag === "insert") ins.push(i1);
+    else for (let i = i1; i < i2; i++) d.push(i);
+  }
+  return { n, d, ins };
+}
+
+export function sentencePlainOffsets(html) {
+  // Plain-text [start, end) offset of each sentence, matching ProseMirror's
+  // text positions (entities decoded, <br> counts as one position).
+  const out = [];
+  let pos = 0;
+  const div = document.createElement("div");
+  for (const s of splitSentencesHtml(html || "")) {
+    div.innerHTML = s;
+    const len = div.textContent.length + div.querySelectorAll("br").length;
+    out.push([pos, pos + len]);
+    pos += len;
+  }
+  return out;
+}
+
 export function planSentenceUpdates(oldSrcHtml, newSrcHtml, existingTgtHtml) {
   // Plan a sentence-level update of a translated block. Returns ops
   // ["keep", targetSentence] / ["translate", sourceSentence] in output order,

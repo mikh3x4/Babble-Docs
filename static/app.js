@@ -27,7 +27,7 @@ import * as D from "./docmodel.js";
 import * as T from "./translate.js";
 import {
   LANGUAGE_CATALOG, newId, escapeHtml, sanitizeInlineHtml, stripTags,
-  mergeBlocks, renderBlocks, blockContext,
+  mergeBlocks, renderBlocks, blockContext, diffSentenceIndices, sentencePlainOffsets,
 } from "./core.js";
 
 // --- Schema -----------------------------------------------------------------
@@ -225,7 +225,21 @@ const idPlugin = new Plugin({
   },
 });
 
+// Translation-state decorations. Input: Map(blockId -> mark) where mark is
+//   {kind: "in"|"out", all: true}                  whole-block highlight
+//   {kind, sents: [[s,e],...], ins: [offset,...]}  sentence-level highlight
+// "in" (yellow) = incoming translation will replace this text; "out" (blue) =
+// this text is being translated outward; ins = blank-space placeholders where
+// newly added text will appear.
 const pendingKey = new PluginKey("pending");
+
+function gapWidget() {
+  const el = document.createElement("span");
+  el.className = "incoming-gap";
+  el.textContent = "\u00a0\u00a0\u00a0";
+  return el;
+}
+
 const pendingPlugin = new Plugin({
   key: pendingKey,
   state: {
@@ -234,15 +248,37 @@ const pendingPlugin = new Plugin({
   },
   props: {
     decorations(state) {
-      const pending = pendingKey.getState(state);
-      if (!pending || ![...pending.values()].some(Boolean)) return null;
+      const marks = pendingKey.getState(state);
+      if (!marks || !marks.size) return null;
       const decos = [];
       state.doc.descendants((node, pos) => {
         if (!ID_TYPES.has(node.type.name)) return true;
         const inItem = node.type.name === "paragraph" &&
           state.doc.resolve(pos).parent.type.name === "list_item";
-        if (!inItem && pending.get(node.attrs.id)) {
-          decos.push(Decoration.node(pos, pos + node.nodeSize, { class: "pending" }));
+        if (inItem) return false;
+        const m = marks.get(node.attrs.id);
+        if (m) {
+          const cls = m.kind === "out" ? "outgoing" : "pending";
+          if (m.all) {
+            decos.push(Decoration.node(pos, pos + node.nodeSize, { class: cls }));
+          } else {
+            // The text lives in the node itself, except list items, where it
+            // lives in the first (paragraph) child.
+            let textNode = node, textPos = pos;
+            if (node.type.name === "list_item" && node.firstChild) {
+              textNode = node.firstChild;
+              textPos = pos + 1;
+            }
+            const base = textPos + 1;
+            const max = textNode.content.size;
+            for (const [s, e] of m.sents || []) {
+              const a = Math.min(s, max), b = Math.min(e, max);
+              if (b > a) decos.push(Decoration.inline(base + a, base + b, { class: cls }));
+            }
+            for (const off of m.ins || []) {
+              decos.push(Decoration.widget(base + Math.min(off, max), gapWidget, { side: -1 }));
+            }
+          }
         }
         return true;
       });
@@ -320,6 +356,7 @@ const clientId = newId();
 const translateTimers = new Map(); // blockId -> timeout
 const heldLocks = new Set();       // blockIds we hold appProperties locks for
 const prevHtmlById = new Map();    // blockId -> pre-edit source html (in-memory only, for sentence diffing)
+const sentenceState = new Map();   // blockId -> {n, d, ins} sentence-level change info (own edits + others' locks)
 
 const sigOf = (b) => `${b.type}|${JSON.stringify(b.attrs || {})}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -362,10 +399,41 @@ function updateTranslating() {
   els.translating.hidden = !(model?.blocks.some((b) => b.pending?.length) || lockedBlocks.size);
 }
 
-// Awaiting-translation (from meta) and being-translated-right-now (from lock
-// comments) blocks share the yellow highlight.
-const pendingMapOf = (blocks) =>
-  new Map(blocks.map((b) => [b.id, !!b.pending || lockedBlocks.has(b.id)]));
+function decorationInput(rendered) {
+  // For every block awaiting/undergoing translation, decide what to highlight
+  // in the current view: outgoing (blue) sentences in the source language,
+  // incoming (yellow) sentences + insertion gaps in target languages. Without
+  // sentence info (no history / unaligned), fall back to the whole block.
+  const blockById = new Map(model.blocks.map((b) => [b.id, b]));
+  const map = new Map();
+  for (const rb of rendered) {
+    const blk = blockById.get(rb.id);
+    const active = lockedBlocks.has(rb.id) || !!rb.pending || !!blk?.pending?.length;
+    if (!active || !blk) continue;
+    const st = sentenceState.get(rb.id);
+    const offsets = () => sentencePlainOffsets(rb.html);
+    if (lang === blk.source) {
+      if (st?.n?.length) {
+        const off = offsets();
+        map.set(rb.id, { kind: "out", sents: st.n.filter((i) => i < off.length).map((i) => off[i]) });
+      } else {
+        map.set(rb.id, { kind: "out", all: true });
+      }
+    } else if ((blk.pending || []).includes(lang) || lockedBlocks.has(rb.id)) {
+      if (st && (st.d?.length || st.ins?.length)) {
+        const off = offsets();
+        map.set(rb.id, {
+          kind: "in",
+          sents: (st.d || []).filter((i) => i < off.length).map((i) => off[i]),
+          ins: (st.ins || []).map((i) => (i < off.length ? off[i][0] : (off[off.length - 1]?.[1] ?? 0))),
+        });
+      } else {
+        map.set(rb.id, { kind: "in", all: true });
+      }
+    }
+  }
+  return map;
+}
 
 // --- Editor ----------------------------------------------------------------------
 
@@ -429,12 +497,16 @@ function sendUpdate() {
 
   const beforeOrder = model.blocks.map((b) => b.id).join(",");
   const beforeSigs = new Map(model.blocks.map((b) => [b.id, sigOf(b)]));
+  const oldSourceById = new Map(model.blocks.map((b) => [b.id, b.source]));
   const dirty = mergeBlocks(model, payload, lang);
   // Keep the pre-edit source text in memory for sentence-level diffing; it is
   // not persisted (a dead client just costs one whole-block retranslation).
   for (const id of dirty) {
     const b = model.blocks.find((x) => x.id === id);
     if (b?.prev_html && !prevHtmlById.has(id)) prevHtmlById.set(id, b.prev_html);
+    const info = diffSentenceIndices(prevHtmlById.get(id), b?.content[b.source]);
+    if (info) sentenceState.set(id, info);
+    else sentenceState.delete(id); // no history: whole-block highlight
   }
   // Type/attr changes (heading toggle, list indent) and reorders show in every
   // language tab, so they force a full rewrite of all of them; plain text
@@ -446,8 +518,19 @@ function sendUpdate() {
     model.blocks.some((b) => beforeSigs.has(b.id) && beforeSigs.get(b.id) !== sigOf(b));
   applyLocalModel();
   const plans = {};
-  if (structureChanged) for (const l of model.languages) plans[l.code] = "full";
-  else plans[lang] = new Set(dirty);
+  if (structureChanged) {
+    for (const l of model.languages) plans[l.code] = "full";
+  } else {
+    plans[lang] = new Set(dirty);
+    // When a block's source language changes (edited in a language that
+    // wasn't the source), revoke the old source tab's own==src claim in the
+    // SAME atomic write — otherwise other clients briefly see two tabs
+    // claiming source and can mark the fresh edit as stale.
+    for (const id of dirty) {
+      const old = oldSourceById.get(id);
+      if (old && old !== lang) (plans[old] = plans[old] || new Set()).add(id);
+    }
+  }
   queueWrite(plans, false);
   for (const id of dirty) scheduleTranslate(id);
 }
@@ -456,7 +539,7 @@ function applyLocalModel() {
   // Refresh pending highlights + cost from the local model without touching text.
   if (!view) return;
   const rendered = renderBlocks(model, lang);
-  view.dispatch(view.state.tr.setMeta(pendingKey, pendingMapOf(rendered)));
+  view.dispatch(view.state.tr.setMeta(pendingKey, decorationInput(rendered)));
   updateTranslating();
   updateCost();
 }
@@ -466,7 +549,7 @@ function applyRemote(blocks) {
   if (hasUnsentChanges()) { skippedRemote = true; return; }
 
   lastReceived = new Map(blocks.map((b) => [b.id, { html: b.html, sig: sigOf(b) }]));
-  const pending = pendingMapOf(blocks);
+  const pending = decorationInput(blocks);
   const newDoc = blocksToDoc(blocks);
 
   applyingRemote = true;
@@ -761,7 +844,17 @@ function deriveModel(doc, meta) {
     }
     let source = null;
     for (const [code, e] of entries) if (!e.own || e.own !== e.hash) { source = code; break; } // edited wins
-    if (!source) for (const [code, e] of entries) if (e.own && e.own === e.src) { source = code; break; }
+    if (!source) {
+      // Among tabs claiming source (own==src), prefer the one the other
+      // tabs' srcHashes actually point at — resolves transient dual claims.
+      let bestScore = -1;
+      for (const [code, e] of entries) {
+        if (!e.own || e.own !== e.src) continue;
+        let score = 0;
+        for (const [c2, e2] of entries) if (c2 !== code && e2.src === e.hash) score++;
+        if (score > bestScore) { bestScore = score; source = code; }
+      }
+    }
     if (!source) source = base.code;
     const srcEntry = entries.get(source) || bb;
     const shared = srcEntry.type === "code" || !stripTags(srcEntry.html).trim();
@@ -857,17 +950,32 @@ const lockKey = (blockId) => `lock_${blockId}`;
 
 function parseLockVal(v) {
   if (!v) return null;
-  const [c, t] = String(v).split(":");
-  return { c, t: Number(t) || 0 };
+  const [c, t, spec] = String(v).split(":");
+  const out = { c, t: Number(t) || 0, st: null };
+  // spec: "n1,3;d1;i2" — sentence indices (see diffSentenceIndices).
+  const m = spec && spec.match(/^n([\d,]*);d([\d,]*);i([\d,]*)$/);
+  if (m) {
+    const nums = (s) => s ? s.split(",").map(Number) : [];
+    out.st = { n: nums(m[1]), d: nums(m[2]), ins: nums(m[3]) };
+  }
+  return out;
+}
+
+function encodeLockSpec(st) {
+  if (!st) return "";
+  const spec = `n${st.n.join(",")};d${st.d.join(",")};i${st.ins.join(",")}`;
+  return spec.length <= 80 ? `:${spec}` : ""; // appProperties values cap at ~124 bytes
 }
 
 async function acquireLock(blockId) {
   // appProperties are per-key, so concurrent clients can't clobber each
-  // other's locks; the write-then-read-back settles same-key races.
+  // other's locks; the write-then-read-back settles same-key races. The value
+  // carries the affected sentences so other clients highlight only those.
   const key = lockKey(blockId);
   const pre = parseLockVal((await G.getFileMeta(docId)).appProperties?.[key]);
   if (pre && pre.c !== clientId && Date.now() - pre.t < LOCK_TTL_MS) return false;
-  await G.setAppProperties(docId, { [key]: `${clientId}:${Date.now()}` });
+  const spec = encodeLockSpec(sentenceState.get(blockId));
+  await G.setAppProperties(docId, { [key]: `${clientId}:${Date.now()}${spec}` });
   const post = parseLockVal((await G.getFileMeta(docId)).appProperties?.[key]);
   if (post?.c !== clientId) return false;
   heldLocks.add(blockId);
@@ -889,7 +997,12 @@ function scanLocks(appProperties) {
     if (!k.startsWith("lock_")) continue;
     const l = parseLockVal(v);
     if (l && now - l.t < LOCK_TTL_MS) {
-      if (l.c !== clientId) fresh.add(k.slice(5));
+      if (l.c !== clientId) {
+        const blockId = k.slice(5);
+        fresh.add(blockId);
+        // Adopt the locker's sentence info (our own edits take precedence).
+        if (l.st && !prevHtmlById.has(blockId)) sentenceState.set(blockId, l.st);
+      }
     } else if (canEdit) {
       staleKeys[k] = null;
     }
@@ -960,6 +1073,7 @@ async function translateBlock(blockId) {
     if (!cur.pending?.length) {
       delete cur.prev_html;
       prevHtmlById.delete(blockId);
+      sentenceState.delete(blockId);
     }
     queueWrite(changedTabs, true); // meta carries the updated usage/cost
     if (lang !== cur.source) applyRemote(renderBlocks(model, lang));
@@ -1242,6 +1356,8 @@ els.openOther.onclick = () => {
   sendTimer = null;
   for (const t of translateTimers.values()) clearTimeout(t);
   translateTimers.clear();
+  sentenceState.clear();
+  prevHtmlById.clear();
   model = null; docId = null; docSnapshot = null;
   lastVersion = null; lastRevision = null;
   lastReceived = new Map();

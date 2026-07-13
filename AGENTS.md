@@ -40,8 +40,16 @@ and tag ordering never look like edits. `babel:meta` tab = config only
 derived, never stored. prev_html for sentence-diffing is in-memory only
 (`prevHtmlById`) — a dead client costs one whole-block retranslation.
 Translation locks are Drive `appProperties` (`lock_<blockId>` =
-`clientId:ts`, 2 min TTL, invisible, per-key patches) read on the 500ms
-metadata poll. Writes are serialized through `writeChain`, conditioned on
+`clientId:ts[:n..;d..;i..]`, 2 min TTL, invisible, per-key patches) read on
+the 500ms metadata poll; the optional spec carries sentence indices
+(diffSentenceIndices) so other clients highlight only affected sentences:
+yellow `.pending` = incoming replacement, blue `.outgoing` = source text
+being translated out, `.incoming-gap` widget = blank space where inserted
+text will appear. Blocks stay paragraph-granular in storage; sentence
+granularity applies to translation, locking display, and highlights.
+When an edit changes a block's source language, the old source tab's
+own==src claim is revoked in the same atomic batch (and deriveModel
+tie-breaks dual claims by which tab the other srcHashes point at). Writes are serialized through `writeChain`, conditioned on
 `writeControl.requiredRevisionId`, rebuilt+retried on conflict, and end with
 a snapshot refetch.
 
