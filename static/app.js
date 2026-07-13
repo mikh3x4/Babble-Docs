@@ -531,6 +531,17 @@ function sendUpdate() {
       if (old && old !== lang) (plans[old] = plans[old] || new Set()).add(id);
     }
   }
+  // Take the locks NOW (not when translation starts 1s later) so other
+  // clients get the sentence-level info before the content pull marks the
+  // block pending — otherwise they flash a whole-paragraph highlight first.
+  if (dirty.length && canEdit) {
+    const lockProps = {};
+    for (const id of dirty) {
+      lockProps[lockKey(id)] = `${clientId}:${Date.now()}${encodeLockSpec(sentenceState.get(id))}`;
+      heldLocks.add(id);
+    }
+    G.setAppProperties(docId, lockProps).catch(() => {});
+  }
   queueWrite(plans, false);
   for (const id of dirty) scheduleTranslate(id);
 }
@@ -971,6 +982,7 @@ async function acquireLock(blockId) {
   // appProperties are per-key, so concurrent clients can't clobber each
   // other's locks; the write-then-read-back settles same-key races. The value
   // carries the affected sentences so other clients highlight only those.
+  if (heldLocks.has(blockId)) return true; // already taken at edit time
   const key = lockKey(blockId);
   const pre = parseLockVal((await G.getFileMeta(docId)).appProperties?.[key]);
   if (pre && pre.c !== clientId && Date.now() - pre.t < LOCK_TTL_MS) return false;
