@@ -146,6 +146,60 @@ export function diffOpcodes(a, b) {
   return merged;
 }
 
+export function computeSentenceMerge(oldSents, newSents) {
+  // Assign sentence ids to an edited sentence list by diffing against the
+  // previous one. oldSents: [{sid, html}]; newSents: [{pid, html}].
+  // Equal sentences (ignoring trailing whitespace) keep their id; edited
+  // ones reuse the id they replace pairwise (so a sentence being typed in
+  // keeps a stable id); surplus new ones get fresh ids; missing ones are
+  // removed. sepOnly marks a trailing-whitespace-only change (write it, but
+  // don't retranslate).
+  const norm = (h) => String(h ?? "").replace(/\s+$/, "");
+  const a = oldSents.map((s) => norm(s.html));
+  const b = newSents.map((s) => norm(s.html));
+  const out = newSents.map((s) => ({ ...s, sid: null, changed: false, sepOnly: false }));
+  const removed = [];
+  for (const [tag, i1, i2, j1, j2] of diffOpcodes(a, b)) {
+    if (tag === "equal") {
+      for (let k = 0; k < j2 - j1; k++) {
+        const o = oldSents[i1 + k];
+        out[j1 + k].sid = o.sid;
+        if (o.html !== newSents[j1 + k].html) out[j1 + k].sepOnly = true;
+      }
+    } else if (tag === "replace") {
+      const len = j2 - j1;
+      for (let k = 0; k < len; k++) {
+        out[j1 + k].changed = true;
+        out[j1 + k].sid = i1 + k < i2 ? oldSents[i1 + k].sid : newId();
+      }
+      for (let i = i1 + len; i < i2; i++) removed.push(oldSents[i].sid);
+    } else if (tag === "insert") {
+      for (let j = j1; j < j2; j++) { out[j].sid = newId(); out[j].changed = true; }
+    } else {
+      for (let i = i1; i < i2; i++) removed.push(oldSents[i].sid);
+    }
+  }
+  return { sents: out, removed };
+}
+
+export function mergeSidSequences(seqs) {
+  // Merge per-language sentence-id sequences of one paragraph into one
+  // canonical order: shared ids anchor the alignment, ids unique to either
+  // side are interleaved after their predecessors. First sequence leads.
+  let acc = seqs[0] ? [...seqs[0]] : [];
+  for (let i = 1; i < seqs.length; i++) {
+    const b = seqs[i];
+    const merged = [];
+    for (const [tag, i1, i2, j1, j2] of diffOpcodes(acc, b)) {
+      if (tag !== "insert") merged.push(...acc.slice(i1, i2));
+      if (tag === "insert" || tag === "replace") merged.push(...b.slice(j1, j2));
+    }
+    const seen = new Set();
+    acc = merged.filter((x) => !seen.has(x) && seen.add(x));
+  }
+  return acc;
+}
+
 export function diffSentenceIndices(prevHtml, newHtml) {
   // Which sentences does an edit touch? Returns {n, d, ins} or null (no
   // history => treat as whole-block):

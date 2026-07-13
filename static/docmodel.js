@@ -1,36 +1,31 @@
-// Conversion between our block model and Google Docs tabs — storage format v2.
+// Conversion between the two-tier model and Google Docs tabs — storage v3.
 //
 // The Google Doc is the database, with no duplicated content:
-//   - One tab per language holds the rendered, human-readable document.
-//     Every block is exactly one paragraph; soft line breaks (\v) stand
-//     in for <br>.
-//   - Block identity AND sync state live in invisible named ranges:
-//         babel:<id>:<ownHash>:<srcHash>
-//     ownHash = hash of this block's content in this tab when the app last
-//     wrote it. actual-vs-ownHash mismatch => text was edited outside the
-//     app (or a client died mid-write) => reconcile (the expensive path).
-//     srcHash = hash of the source-language content this translation was
-//     made from. srcHash != the source tab's actual hash => translation is
-//     stale (pending). own == src marks the block's source language.
+//   - One tab per language; every PARAGRAPH block is one Docs paragraph
+//     (heading/list/quote/code styling as before).
+//   - Paragraph identity + structure: invisible named range
+//         babelp:<pid>:<attrsHash>        (attrsHash = hash(type|attrs))
+//     spanning the paragraph. attrsHash mismatch vs the parsed style means
+//     the paragraph was restyled outside the app.
+//   - SENTENCES are the sync unit. Each sentence's span carries
+//         babel:<sid>:<ownHash>:<srcHash>
+//     ownHash = hash of the sentence text at last app write (actual-vs-own
+//     mismatch, or text not covered by sentence ranges => external edit =>
+//     reconcile). srcHash = hash of the source-language sentence this
+//     translation was made from (mismatch vs the source's actual hash =>
+//     stale => pending). own == src marks the sentence's source language.
+//   - Segmentation in translated tabs is DEFINED by the ranges — sentence
+//     heuristics only ever run on the language being edited, so CJK
+//     punctuation or model output never break alignment.
 //   - A tab named `babel:meta` holds only config: languages<->tabIds, the
 //     Anthropic API key, the model, and usage/cost counters.
-//
-// Hashes are computed over a canonical form (type | attrs | canonical inline
-// HTML) so that Docs run-splitting and tag-ordering differences never look
-// like edits. All parsing goes through the same canonicalization.
-//
-// Docs encoding of block types:
-//   heading    -> namedStyleType HEADING_1..3
-//   list_item  -> real Docs bullets (nesting = bullet nestingLevel)
-//   blockquote -> indentStart 36pt
-//   code       -> paragraph shading (light gray) + Courier New
-//   inline code-> Courier New runs inside an unshaded paragraph
 
 import { escapeHtml } from "./core.js";
 
 export const META_TAB_TITLE = "babel:meta";
 export const STALE_HASH = "00000000"; // srcHash that never matches: forces retranslation
-const RANGE_PREFIX = "babel:";
+const SENT_PREFIX = "babel:";
+const PARA_PREFIX = "babelp:";
 const CODE_FONT = "Courier New";
 const GRAY = { color: { rgbColor: { red: 0.956, green: 0.96, blue: 0.97 } } };
 
@@ -45,20 +40,25 @@ function fnv1a(str) {
   return h.toString(16).padStart(8, "0");
 }
 
-const stableStringify = (obj) =>
-  JSON.stringify(obj || {}, Object.keys(obj || {}).sort());
+const stableStringify = (obj) => JSON.stringify(obj || {}, Object.keys(obj || {}).sort());
 
-export function blockHash(type, attrs, html) {
-  const body = type === "code" ? html : canonicalInline(html);
-  return fnv1a(`${type}|${stableStringify(attrs)}|${body}`);
+export const sentHash = (html) => fnv1a(canonicalInline(html));
+export const codeHash = (html) => fnv1a(String(html || ""));
+export const attrsHash = (type, attrs) => fnv1a(`${type}|${stableStringify(attrs)}`);
+
+export const sentRangeName = (sid, own, src) => `${SENT_PREFIX}${sid}:${own}:${src}`;
+export const paraRangeName = (pid, ah) => `${PARA_PREFIX}${pid}:${ah}`;
+
+export function parseSentRangeName(name) {
+  if (!name.startsWith(SENT_PREFIX) || name.startsWith(PARA_PREFIX)) return null;
+  const [sid, own, src] = name.slice(SENT_PREFIX.length).split(":");
+  return sid && own && src ? { sid, own, src } : null;
 }
 
-export const rangeName = (id, own, src) => `${RANGE_PREFIX}${id}:${own}:${src}`;
-
-export function parseRangeName(name) {
-  if (!name.startsWith(RANGE_PREFIX)) return null;
-  const [id, own, src] = name.slice(RANGE_PREFIX.length).split(":");
-  return { id, own: own || null, src: src || null };
+export function parseParaRangeName(name) {
+  if (!name.startsWith(PARA_PREFIX)) return null;
+  const [pid, ah] = name.slice(PARA_PREFIX.length).split(":");
+  return pid ? { pid, ah: ah || null } : null;
 }
 
 // --- Tab discovery -----------------------------------------------------------
@@ -124,11 +124,7 @@ export function metaRewriteRequests(tab, meta) {
   return requests;
 }
 
-// --- Styled segments: the canonical inline representation ---------------------------
-// A segment is {text, style:{bold,italic,underline,strike,code,link}}. Both the
-// HTML side (editor/model) and the Docs side (textRuns) reduce to segments;
-// canonical HTML is emitted from merged segments with a fixed tag order, so
-// equivalent content always produces identical bytes (and identical hashes).
+// --- Styled segments: canonical inline representation ---------------------------
 
 function segmentsFromHtml(html) {
   const div = document.createElement("div");
@@ -156,24 +152,6 @@ function segmentsFromHtml(html) {
     }
   };
   walk(div, {});
-  return segments;
-}
-
-function segmentsFromRuns(runs) {
-  const segments = [];
-  for (const run of runs) {
-    const ts = run.textStyle || {};
-    const text = run.content.replace(/\n$/, "");
-    if (!text) continue;
-    const style = {};
-    if (ts.bold) style.bold = true;
-    if (ts.italic) style.italic = true;
-    if (ts.underline && !ts.link) style.underline = true;
-    if (ts.strikethrough) style.strike = true;
-    if ((ts.weightedFontFamily?.fontFamily || "").includes("Courier")) style.code = true;
-    if (ts.link?.url && /^https?:\/\//.test(ts.link.url)) style.link = ts.link.url;
-    segments.push({ text, style });
-  }
   return segments;
 }
 
@@ -223,39 +201,51 @@ function textStyleFor(style, isCodeBlock) {
   return fields.length ? { textStyle: ts, fields: fields.join(",") } : null;
 }
 
-// --- Blocks -> Docs requests ---------------------------------------------------------
+// --- Rendering: paragraph pieces -> text + style runs --------------------------------
+// A render paragraph is {pid, type, attrs, pieces: [{sid, html, own, src}]}.
+// Pieces concatenate into one Docs paragraph; each piece gets a sentence range.
 
-function blockRenderPlan(block) {
-  let segments;
-  if (block.type === "code") {
+function pieceSegments(piece, isCode) {
+  if (isCode) {
     const div = document.createElement("div");
-    div.innerHTML = block.html;
-    segments = [{ text: div.textContent.replace(/\n/g, "\u000b"), style: {} }];
-  } else {
-    segments = mergeSegments(segmentsFromHtml(block.html));
+    div.innerHTML = piece.html;
+    return [{ text: div.textContent.replace(/\n/g, "\u000b"), style: {} }];
   }
-  const indentTabs = block.type === "list_item" ? Math.max(Math.floor(block.attrs?.indent) || 0, 0) : 0;
-  const prefix = "\t".repeat(indentTabs);
-  let offset = prefix.length;
-  const styleRuns = [];
-  for (const seg of segments) {
-    if (seg.text.length && Object.keys(seg.style).length) {
-      styleRuns.push({ offset, length: seg.text.length, style: seg.style });
-    }
-    offset += seg.text.length;
-  }
-  return { text: prefix + segments.map((s) => s.text).join(""), styleRuns };
+  return mergeSegments(segmentsFromHtml(piece.html));
 }
 
-function paragraphStyleRequest(block, range) {
+function paraRenderPlan(para, withIndent) {
+  const isCode = para.type === "code";
+  const indent = para.type === "list_item" ? Math.max(Math.floor(para.attrs?.indent) || 0, 0) : 0;
+  const prefix = withIndent ? "\t".repeat(indent) : "";
+  let offset = prefix.length;
+  const styleRuns = [];
+  const pieceSpans = []; // {sid, own, src, start, end} offsets within paragraph text
+  let text = prefix;
+  for (const piece of para.pieces) {
+    const segs = pieceSegments(piece, isCode);
+    const pieceStart = offset;
+    for (const seg of segs) {
+      if (seg.text.length && Object.keys(seg.style).length) {
+        styleRuns.push({ offset, length: seg.text.length, style: seg.style });
+      }
+      offset += seg.text.length;
+      text += seg.text;
+    }
+    pieceSpans.push({ sid: piece.sid, own: piece.own, src: piece.src, start: pieceStart, end: offset });
+  }
+  return { text, styleRuns, pieceSpans, isCode };
+}
+
+function paragraphStyleRequest(para, range) {
   const ps = {};
   let named = "NORMAL_TEXT";
-  if (block.type === "heading") {
-    named = `HEADING_${Math.min(Math.max(block.attrs?.level || 1, 1), 3)}`;
+  if (para.type === "heading") {
+    named = `HEADING_${Math.min(Math.max(para.attrs?.level || 1, 1), 3)}`;
   }
   ps.namedStyleType = named;
-  if (block.type === "blockquote") ps.indentStart = { magnitude: 36, unit: "PT" };
-  if (block.type === "code") ps.shading = { backgroundColor: GRAY };
+  if (para.type === "blockquote") ps.indentStart = { magnitude: 36, unit: "PT" };
+  if (para.type === "code") ps.shading = { backgroundColor: GRAY };
   return {
     updateParagraphStyle: {
       range,
@@ -267,14 +257,57 @@ function paragraphStyleRequest(block, range) {
 
 const RESET_FIELDS = "bold,italic,underline,strikethrough,link,weightedFontFamily,backgroundColor";
 
-export function fullTabRewriteRequests(tab, blocks, nameFor) {
-  // Replace a language tab's entire body with the rendered blocks and fresh
-  // named ranges (nameFor(block) supplies babel:<id>:<own>:<src>).
+function inlineStyleRequests(tabId, base, plan) {
+  const requests = [];
+  const contentLen = plan.text.length;
+  if (contentLen) {
+    requests.push({ updateTextStyle: {
+      range: { startIndex: base, endIndex: base + contentLen, tabId },
+      textStyle: {}, fields: RESET_FIELDS,
+    } });
+    if (plan.isCode) {
+      requests.push({ updateTextStyle: {
+        range: { startIndex: base, endIndex: base + contentLen, tabId },
+        textStyle: { weightedFontFamily: { fontFamily: CODE_FONT } },
+        fields: "weightedFontFamily",
+      } });
+    }
+  }
+  for (const run of plan.styleRuns) {
+    const req = textStyleFor(run.style, plan.isCode);
+    if (req) {
+      requests.push({ updateTextStyle: {
+        range: { startIndex: base + run.offset, endIndex: base + run.offset + run.length, tabId },
+        ...req,
+      } });
+    }
+  }
+  return requests;
+}
+
+function rangeRequests(tabId, base, para, plan, paraEnd) {
+  // paraEnd = index just past the paragraph's trailing newline.
+  const requests = [];
+  requests.push({ createNamedRange: {
+    name: paraRangeName(para.pid, attrsHash(para.type, para.attrs)),
+    range: { startIndex: base, endIndex: paraEnd, tabId },
+  } });
+  for (const ps of plan.pieceSpans) {
+    if (ps.end > ps.start) {
+      requests.push({ createNamedRange: {
+        name: sentRangeName(ps.sid, ps.own, ps.src),
+        range: { startIndex: base + ps.start, endIndex: base + ps.end, tabId },
+      } });
+    }
+  }
+  return requests;
+}
+
+export function fullTabRewriteRequests(tab, paras) {
   const tabId = tab.tabProperties.tabId;
   const requests = [];
-
   for (const name of Object.keys(tab.documentTab.namedRanges || {})) {
-    if (name.startsWith(RANGE_PREFIX)) {
+    if (name.startsWith(SENT_PREFIX) || name.startsWith(PARA_PREFIX)) {
       requests.push({ deleteNamedRange: { name, tabsCriteria: { tabIds: [tabId] } } });
     }
   }
@@ -282,61 +315,40 @@ export function fullTabRewriteRequests(tab, blocks, nameFor) {
   if (end - 1 > 1) {
     requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex: end - 1, tabId } } });
   }
-  if (!blocks.length) return requests;
+  if (!paras.length) return requests;
 
-  const plans = blocks.map(blockRenderPlan);
+  const plans = paras.map((p) => paraRenderPlan(p, true));
   const fullText = plans.map((p) => p.text).join("\n");
   requests.push({ insertText: { location: { index: 1, tabId }, text: fullText } });
 
   let pos = 1;
-  const spans = plans.map((p) => {
-    const start = pos;
-    pos += p.text.length + 1;
-    return { start, end: start + p.text.length };
-  });
-
   const bulletRuns = [];
-  blocks.forEach((block, i) => {
-    const { start, end: contentEnd } = spans[i];
-    const styleRange = { startIndex: start, endIndex: Math.max(contentEnd, start + 1), tabId };
-    requests.push(paragraphStyleRequest(block, styleRange));
-    if (contentEnd > start) {
-      requests.push({ updateTextStyle: { range: { startIndex: start, endIndex: contentEnd, tabId }, textStyle: {}, fields: RESET_FIELDS } });
-      if (block.type === "code") {
-        requests.push({ updateTextStyle: {
-          range: { startIndex: start, endIndex: contentEnd, tabId },
-          textStyle: { weightedFontFamily: { fontFamily: CODE_FONT } },
-          fields: "weightedFontFamily",
-        } });
-      }
-    }
-    for (const run of plans[i].styleRuns) {
-      const req = textStyleFor(run.style, block.type === "code");
-      if (req) {
-        requests.push({ updateTextStyle: {
-          range: { startIndex: start + run.offset, endIndex: start + run.offset + run.length, tabId },
-          ...req,
-        } });
-      }
-    }
-    const nrEnd = i === blocks.length - 1 ? 1 + fullText.length + 1 : spans[i + 1].start;
-    requests.push({ createNamedRange: {
-      name: nameFor(block),
-      range: { startIndex: start, endIndex: nrEnd, tabId },
-    } });
-    if (block.type === "list_item") {
-      const ordered = block.attrs?.list === "ordered";
+  paras.forEach((para, i) => {
+    const plan = plans[i];
+    const start = pos;
+    const contentEnd = start + plan.text.length;
+    const paraEnd = i === paras.length - 1 ? 1 + fullText.length + 1 : contentEnd + 1;
+    pos = contentEnd + 1;
+
+    requests.push(paragraphStyleRequest(para, {
+      startIndex: start, endIndex: Math.max(contentEnd, start + 1), tabId,
+    }));
+    requests.push(...inlineStyleRequests(tabId, start, plan));
+    requests.push(...rangeRequests(tabId, start, para, plan, paraEnd));
+
+    if (para.type === "list_item") {
+      const ordered = para.attrs?.list === "ordered";
       const last = bulletRuns[bulletRuns.length - 1];
-      if (last && last.ordered === ordered && last.endBlock === i - 1) {
-        last.end = contentEnd; last.endBlock = i;
+      if (last && last.ordered === ordered && last.endPara === i - 1) {
+        last.end = contentEnd; last.endPara = i;
       } else {
-        bulletRuns.push({ start, end: contentEnd, ordered, endBlock: i });
+        bulletRuns.push({ start, end: contentEnd, ordered, endPara: i });
       }
     }
   });
 
   // createParagraphBullets consumes the leading tabs (shifting later indices),
-  // so bullet requests go last, bottom-up.
+  // so bullet requests go last, bottom-up. Named ranges shrink automatically.
   for (const run of bulletRuns.reverse()) {
     requests.push({ createParagraphBullets: {
       range: { startIndex: run.start, endIndex: Math.max(run.end, run.start + 1), tabId },
@@ -346,87 +358,94 @@ export function fullTabRewriteRequests(tab, blocks, nameFor) {
   return requests;
 }
 
-export function singleBlockRewriteRequests(tab, block, span, name, oldNames) {
-  // Content-only rewrite of one block inside its existing paragraph. `span` is
-  // the block's current named-range span [start, end) (newline included).
-  // Keeps paragraph-level style and bullets; replaces text, inline styles, and
-  // the named range (whose name carries the new hashes).
+export function paraRewriteRequests(tab, parsedPara, para) {
+  // Content-only rewrite of one paragraph (type/attrs unchanged — structural
+  // changes go through full rewrites). Replaces text, inline styles, and all
+  // of the paragraph's ranges with exact recomputed spans.
   const tabId = tab.tabProperties.tabId;
-  const [start, end] = span;
+  const [pStart, pEnd] = parsedPara.span; // [start, end) incl. trailing newline
   const requests = [];
-  const plan = blockRenderPlan({ ...block, attrs: { ...block.attrs, indent: 0 } }); // no tabs: bullet already set
-  if (end - 1 > start) {
-    requests.push({ deleteContentRange: { range: { startIndex: start, endIndex: end - 1, tabId } } });
+  const plan = paraRenderPlan(para, false); // bullets already applied; no tab prefix
+  if (pEnd - 1 > pStart) {
+    requests.push({ deleteContentRange: { range: { startIndex: pStart, endIndex: pEnd - 1, tabId } } });
   }
   if (plan.text.length) {
-    requests.push({ insertText: { location: { index: start, tabId }, text: plan.text } });
-    requests.push({ updateTextStyle: {
-      range: { startIndex: start, endIndex: start + plan.text.length, tabId },
-      textStyle: {}, fields: RESET_FIELDS,
-    } });
-    if (block.type === "code") {
-      requests.push({ updateTextStyle: {
-        range: { startIndex: start, endIndex: start + plan.text.length, tabId },
-        textStyle: { weightedFontFamily: { fontFamily: CODE_FONT } },
-        fields: "weightedFontFamily",
-      } });
-    }
-    for (const run of plan.styleRuns) {
-      const req = textStyleFor(run.style, block.type === "code");
-      if (req) {
-        requests.push({ updateTextStyle: {
-          range: { startIndex: start + run.offset, endIndex: start + run.offset + run.length, tabId },
-          ...req,
-        } });
-      }
-    }
+    requests.push({ insertText: { location: { index: pStart, tabId }, text: plan.text } });
+    requests.push(...inlineStyleRequests(tabId, pStart, plan));
   }
-  for (const old of oldNames || []) {
+  for (const old of parsedPara.rangeNames || []) {
     requests.push({ deleteNamedRange: { name: old, tabsCriteria: { tabIds: [tabId] } } });
   }
-  requests.push({ createNamedRange: {
-    name,
-    range: { startIndex: start, endIndex: start + plan.text.length + 1, tabId },
-  } });
+  requests.push(...rangeRequests(tabId, pStart, para, plan, pStart + plan.text.length + 1));
   return requests;
 }
 
-// --- Docs tab -> blocks -----------------------------------------------------------
+// --- Docs tab -> parsed paragraphs -------------------------------------------------
+
+function runSegmentsAbs(runs) {
+  // Absolute-position styled segments: [{start, end, text, style}]
+  const out = [];
+  for (const pe of runs) {
+    const run = pe.textRun;
+    const text = run.content.replace(/\n$/, "");
+    if (!text) continue;
+    const ts = run.textStyle || {};
+    const style = {};
+    if (ts.bold) style.bold = true;
+    if (ts.italic) style.italic = true;
+    if (ts.underline && !ts.link) style.underline = true;
+    if (ts.strikethrough) style.strike = true;
+    if ((ts.weightedFontFamily?.fontFamily || "").includes("Courier")) style.code = true;
+    if (ts.link?.url && /^https?:\/\//.test(ts.link.url)) style.link = ts.link.url;
+    out.push({ start: pe.startIndex, end: pe.startIndex + text.length, text, style });
+  }
+  return out;
+}
+
+function sliceSegments(segsAbs, s, e) {
+  const out = [];
+  for (const seg of segsAbs) {
+    const a = Math.max(seg.start, s), b = Math.min(seg.end, e);
+    if (b > a) out.push({ text: seg.text.slice(a - seg.start, b - seg.start), style: seg.style });
+  }
+  return out;
+}
 
 export function parseLanguageTab(tab) {
-  // Returns {blocks, spans}. Each block: {id|null, own|null, src|null, name,
-  // type, attrs, html (canonical), hash (actual)}; spans: id -> [s, e).
+  // Returns {paras, dirty}. Each para: {pid|null, type, attrs, span:[s,e),
+  // rangeNames, rawHtml, sents:[{sid, own, src, html, hash}], broken}.
+  // A paragraph is broken when its text isn't exactly covered, in order, by
+  // consistent sentence ranges — i.e. someone edited it outside the app.
   const documentTab = tab.documentTab;
   const lists = documentTab.lists || {};
 
-  // babel named ranges: id -> {name, own, src, spans:[[s,e)...]}
-  const rangesById = new Map();
+  const sentRanges = [];  // {sid, own, src, name, s, e}
+  const paraRanges = [];  // {pid, ah, name, s, e}
   for (const [name, group] of Object.entries(documentTab.namedRanges || {})) {
-    const parsed = parseRangeName(name);
-    if (!parsed) continue;
+    const pr = parseParaRangeName(name);
+    const sr = pr ? null : parseSentRangeName(name);
+    if (!pr && !sr) continue;
     for (const nr of group.namedRanges || []) {
       for (const r of nr.ranges || []) {
-        if (!rangesById.has(parsed.id)) rangesById.set(parsed.id, { ...parsed, name, spans: [] });
-        rangesById.get(parsed.id).spans.push([r.startIndex ?? 0, r.endIndex]);
+        const span = { s: r.startIndex ?? 0, e: r.endIndex, name };
+        if (pr) paraRanges.push({ ...pr, ...span });
+        else sentRanges.push({ ...sr, ...span });
       }
     }
   }
-  const rangeAt = (index) => {
-    for (const info of rangesById.values()) {
-      for (const [s, e] of info.spans) if (index >= s && index < e) return info;
-    }
-    return null;
-  };
+  sentRanges.sort((a, b) => a.s - b.s);
 
-  const blocks = [];
-  const spans = new Map();
-  const usedIds = new Set();
+  const paras = [];
+  const usedPids = new Set();
+  const usedSids = new Set();
   for (const el of documentTab.body.content || []) {
     if (!el.paragraph) continue;
     const p = el.paragraph;
     const ps = p.paragraphStyle || {};
-    const runs = (p.elements || []).filter((pe) => pe.textRun).map((pe) => pe.textRun);
-    const plain = runs.map((r) => r.content).join("").replace(/\n$/, "");
+    const runs = (p.elements || []).filter((pe) => pe.textRun);
+    const segsAbs = runSegmentsAbs(runs);
+    const pStart = el.startIndex, pEnd = el.endIndex;
+    const contentEnd = pEnd - 1;
 
     let type = "paragraph", attrs = {};
     const named = ps.namedStyleType || "NORMAL_TEXT";
@@ -445,28 +464,47 @@ export function parseLanguageTab(tab) {
     } else if ((ps.indentStart?.magnitude || 0) >= 18) {
       type = "blockquote";
     }
-    const html = type === "code"
+    const isCode = type === "code";
+    const plain = runs.map((pe) => pe.textRun.content).join("").replace(/\n$/, "");
+    const rawHtml = isCode
       ? escapeHtml(plain.replace(/\u000b/g, "\n"))
-      : htmlFromSegments(mergeSegments(segmentsFromRuns(runs)));
+      : htmlFromSegments(mergeSegments(sliceSegments(segsAbs, pStart, contentEnd)));
 
-    const info = rangeAt(el.startIndex);
-    let id = info && !usedIds.has(info.id) ? info.id : null;
-    if (id) {
-      usedIds.add(id);
-      spans.set(id, [el.startIndex, el.endIndex]);
+    const pr = paraRanges.find((r) => pStart >= r.s && pStart < r.e && !usedPids.has(r.pid));
+    const pid = pr ? pr.pid : null;
+    if (pid) usedPids.add(pid);
+    const attrsOk = pr ? pr.ah === attrsHash(type, attrs) : false;
+
+    // Sentence ranges inside this paragraph, in order.
+    const inPara = sentRanges.filter((r) =>
+      r.s >= pStart && r.s < contentEnd && !usedSids.has(r.sid));
+    const sents = [];
+    let broken = !pr || !attrsOk;
+    let cursor = pStart;
+    for (const r of inPara) {
+      if (r.s !== cursor) broken = true; // gap or overlap
+      const end = Math.min(r.e, contentEnd);
+      const html = isCode
+        ? escapeHtml(plain.slice(r.s - pStart, end - pStart).replace(/\u000b/g, "\n"))
+        : htmlFromSegments(mergeSegments(sliceSegments(segsAbs, r.s, end)));
+      const hash = isCode ? codeHash(html) : sentHash(html);
+      if (r.own !== hash) broken = true;
+      sents.push({ sid: r.sid, own: r.own, src: r.src, html, hash });
+      usedSids.add(r.sid);
+      cursor = end;
     }
-    blocks.push({
-      id,
-      own: id ? info.own : null,
-      src: id ? info.src : null,
-      name: id ? info.name : null,
-      type, attrs, html,
-      hash: blockHash(type, attrs, html),
+    if (cursor !== contentEnd) broken = true; // uncovered trailing text
+    if (contentEnd === pStart && !inPara.length) broken = !pid; // empty para ok if identified
+
+    paras.push({
+      pid, type, attrs,
+      span: [pStart, pEnd],
+      rangeNames: [...(pr ? [pr.name] : []), ...inPara.map((r) => r.name)],
+      rawHtml, sents, broken,
     });
   }
-  // Drop a single trailing unregistered empty paragraph (Docs' mandatory final
-  // newline shows up as one when the last block's named range got clipped).
-  const last = blocks[blocks.length - 1];
-  if (blocks.length && !last.id && !last.html) blocks.pop();
-  return { blocks, spans };
+  // Drop a trailing empty unidentified paragraph (the mandatory final newline).
+  const last = paras[paras.length - 1];
+  if (paras.length && !last.pid && !last.rawHtml) paras.pop();
+  return { paras, dirty: paras.some((p) => p.broken) };
 }

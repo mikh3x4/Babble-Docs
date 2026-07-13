@@ -90,6 +90,15 @@ export async function translateBlockTo(cfg, sourceHtml, prevHtml, existing,
   return parts.join("");
 }
 
+export function translateSentenceTo(cfg, sentenceHtml, paraSrcPlain, tgtParaPlain,
+                                    sourceName, targetName, context, spent) {
+  // v3 entry point: one sentence, with its paragraph (both languages) as
+  // context. tgtParaPlain is the current target paragraph the sentence must
+  // fit into (may be empty for fresh inserts).
+  return translateSentence(cfg, sentenceHtml, paraSrcPlain, tgtParaPlain || null,
+    sourceName, targetName, context, spent);
+}
+
 export async function verifyApiKey(apiKey) {
   // One tiny request to confirm the key works before storing it in the doc.
   const spent = { input: 0, output: 0, calls: 0 };

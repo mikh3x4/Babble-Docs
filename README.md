@@ -17,11 +17,13 @@ the browser with the signed-in user's own OAuth token.
 - **The Google Doc is the storage — with no duplicated content.** One tab per
   language holds the rendered, human-readable document; a small `babel:meta`
   tab holds only config (languages, the Anthropic API key, cost counters).
-- **Block identity and sync state live in invisible named ranges**
-  (`babel:<id>:<ownHash>:<srcHash>`). A block's text hash not matching its
-  range name means it was edited outside the app (picked up and retranslated);
-  a translation whose `srcHash` no longer matches the source block's hash is
-  stale. All state is derivable from the doc itself and self-heals.
+- **Sentences are the unit of sync.** Paragraphs carry structure (headings,
+  bullets, nesting) via `babelp:` named ranges; every sentence has its own
+  invisible `babel:<id>:<ownHash>:<srcHash>` range. Hash mismatches detect
+  outside edits (reconciled and retranslated); a translation whose `srcHash`
+  no longer matches its source sentence is stale. Two people editing
+  different sentences of the same paragraph — same language or different
+  languages — merge cleanly; only same-sentence conflicts are last-write-wins.
 - **Sentence-level translation**: only the sentences you actually edited are
   retranslated (Claude Sonnet, called straight from the browser) — the
   surrounding paragraph and neighboring blocks ride along as context.
