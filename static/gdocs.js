@@ -57,8 +57,9 @@ export function initAuth() {
   });
 }
 
-export function signIn({ silent = false } = {}) {
-  // Resolves with an access token; shows the Google consent popup when needed.
+export function signIn() {
+  // Opens the Google token popup — call ONLY from a user gesture (a click).
+  // With an existing session + prior consent the popup closes immediately.
   return new Promise((resolve, reject) => {
     tokenClient.callback = (resp) => {
       if (resp.error) return reject(new Error(resp.error_description || resp.error));
@@ -68,20 +69,33 @@ export function signIn({ silent = false } = {}) {
       resolve(accessToken);
     };
     tokenClient.error_callback = (err) => reject(new Error(err.message || err.type || "sign-in failed"));
-    tokenClient.requestAccessToken({ prompt: silent ? "" : undefined });
+    tokenClient.requestAccessToken({ prompt: "" });
   });
 }
 
 export const isSignedIn = () => !!accessToken && Date.now() < tokenExpiry;
 
-async function ensureToken() {
-  if (!accessToken) throw new Error("Not signed in");
-  if (Date.now() > tokenExpiry) await signIn({ silent: true });
+// Google's token popup must only ever open from a user click — an automatic
+// refresh attempt (e.g. from the poll loop) turns into popup spam. When the
+// token is gone, API calls throw with .authExpired and the app shows a
+// sign-in button instead.
+export class AuthExpiredError extends Error {
+  constructor() {
+    super("Google sign-in expired");
+    this.authExpired = true;
+  }
+}
+
+function ensureToken() {
+  if (!accessToken || Date.now() > tokenExpiry) {
+    accessToken = null;
+    throw new AuthExpiredError();
+  }
   return accessToken;
 }
 
-async function gfetch(url, options = {}, retry = true) {
-  const token = await ensureToken();
+async function gfetch(url, options = {}) {
+  const token = ensureToken();
   const res = await fetch(url, {
     ...options,
     headers: {
@@ -90,9 +104,10 @@ async function gfetch(url, options = {}, retry = true) {
       ...(options.headers || {}),
     },
   });
-  if (res.status === 401 && retry) {
-    await signIn({ silent: true });
-    return gfetch(url, options, false);
+  if (res.status === 401) {
+    accessToken = null;
+    try { localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+    throw new AuthExpiredError();
   }
   if (!res.ok) {
     let detail = res.statusText;

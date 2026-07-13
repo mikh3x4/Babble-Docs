@@ -322,6 +322,7 @@ const els = {
   setupLang: $("setup-lang"), setupKey: $("setup-key"), setupGo: $("setup-go"),
   setupStatus: $("setup-status"), setupDocName: $("setup-doc-name"),
   docName: $("doc-name"), openInDocs: $("open-in-docs"), share: $("share"), openOther: $("open-other"),
+  reauth: $("reauth"),
   cost: $("cost"), translating: $("translating"), syncDot: $("sync-dot"), syncText: $("sync-text"),
   langSelect: $("lang-select"), addLang: $("add-lang"),
   addLangPanel: $("add-lang-panel"), addLangInput: $("add-lang-input"),
@@ -898,8 +899,14 @@ function queueWrite(plan, metaChanged, intents) {
       setSync("on", "Synced");
     } catch (err) {
       console.error(err);
-      setSync("off", "Save failed");
-      toast(`Save failed: ${err.message}`, true);
+      if (err.authExpired) {
+        setSync("off", "Signed out");
+        els.reauth.hidden = false;
+        toast("Google sign-in expired — click Sign in to resume syncing", true);
+      } else {
+        setSync("off", "Save failed");
+        toast(`Save failed: ${err.message}`, true);
+      }
       lastVersion = null;
       lastRevision = null;
     } finally {
@@ -1060,11 +1067,30 @@ async function pollLoop() {
     }
   } catch (err) {
     console.error(err);
-    setSync("off", /sign|popup|401/i.test(err.message) ? "Sign-in expired — reload" : "Reconnecting…");
+    if (err.authExpired) {
+      // Never open Google's popup automatically — pause sync and wait for
+      // the user to click the Sign in button.
+      setSync("off", "Signed out");
+      els.reauth.hidden = false;
+      return;
+    }
+    setSync("off", "Reconnecting…");
   }
   pollTick += 1;
   pollTimer = setTimeout(pollLoop, 500);
 }
+
+els.reauth.onclick = async () => {
+  try {
+    await G.signIn();
+    els.reauth.hidden = true;
+    lastVersion = null; // force a pull to catch up on whatever we missed
+    lastRevision = null;
+    pollLoop();
+  } catch (err) {
+    toast(`Sign-in failed: ${err.message}`, true);
+  }
+};
 
 // Pull immediately when the window regains focus, so switching between two
 // windows feels instant.
@@ -1415,6 +1441,7 @@ async function openDoc(id) {
 
 async function enterEditor() {
   showView("editor");
+  els.reauth.hidden = true;
   els.docName.textContent = docName;
   els.openInDocs.href = `https://docs.google.com/document/d/${docId}/edit`;
   els.readonly.hidden = canEdit;
