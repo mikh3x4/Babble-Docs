@@ -1,13 +1,23 @@
-// Conversion between our block model and Google Docs tabs.
+// Conversion between our block model and Google Docs tabs — storage format v2.
 //
-// Layout convention inside the Google Doc (the "database"):
-//   - One tab named `babel:meta` holds a JSON blob: languages, API key, model,
-//     usage counters, and the canonical block model (content per language,
-//     pending flags, sentence history). Humans can read it; the app owns it.
+// The Google Doc is the database, with no duplicated content:
 //   - One tab per language holds the rendered, human-readable document.
-//     Every block is exactly one paragraph; soft line breaks (\v) stand in for
-//     <br>. Each block's identity is tracked with a named range `babel:<id>`
-//     so blocks keep their ids (and translations) across edits.
+//     Every block is exactly one paragraph; soft line breaks (\v) stand
+//     in for <br>.
+//   - Block identity AND sync state live in invisible named ranges:
+//         babel:<id>:<ownHash>:<srcHash>
+//     ownHash = hash of this block's content in this tab when the app last
+//     wrote it. actual-vs-ownHash mismatch => text was edited outside the
+//     app (or a client died mid-write) => reconcile (the expensive path).
+//     srcHash = hash of the source-language content this translation was
+//     made from. srcHash != the source tab's actual hash => translation is
+//     stale (pending). own == src marks the block's source language.
+//   - A tab named `babel:meta` holds only config: languages<->tabIds, the
+//     Anthropic API key, the model, and usage/cost counters.
+//
+// Hashes are computed over a canonical form (type | attrs | canonical inline
+// HTML) so that Docs run-splitting and tag-ordering differences never look
+// like edits. All parsing goes through the same canonicalization.
 //
 // Docs encoding of block types:
 //   heading    -> namedStyleType HEADING_1..3
@@ -16,12 +26,40 @@
 //   code       -> paragraph shading (light gray) + Courier New
 //   inline code-> Courier New runs inside an unshaded paragraph
 
-import { escapeHtml, newId } from "./core.js";
+import { escapeHtml } from "./core.js";
 
 export const META_TAB_TITLE = "babel:meta";
+export const STALE_HASH = "00000000"; // srcHash that never matches: forces retranslation
 const RANGE_PREFIX = "babel:";
 const CODE_FONT = "Courier New";
 const GRAY = { color: { rgbColor: { red: 0.956, green: 0.96, blue: 0.97 } } };
+
+// --- Hashing --------------------------------------------------------------------
+
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+const stableStringify = (obj) =>
+  JSON.stringify(obj || {}, Object.keys(obj || {}).sort());
+
+export function blockHash(type, attrs, html) {
+  const body = type === "code" ? html : canonicalInline(html);
+  return fnv1a(`${type}|${stableStringify(attrs)}|${body}`);
+}
+
+export const rangeName = (id, own, src) => `${RANGE_PREFIX}${id}:${own}:${src}`;
+
+export function parseRangeName(name) {
+  if (!name.startsWith(RANGE_PREFIX)) return null;
+  const [id, own, src] = name.slice(RANGE_PREFIX.length).split(":");
+  return { id, own: own || null, src: src || null };
+}
 
 // --- Tab discovery -----------------------------------------------------------
 
@@ -46,7 +84,6 @@ export function tabById(doc, tabId) {
 }
 
 export function tabText(tab) {
-  // All plain text in a tab, paragraphs joined with \n.
   const parts = [];
   for (const el of tab.documentTab.body.content || []) {
     if (!el.paragraph) continue;
@@ -62,7 +99,7 @@ export function bodyEndIndex(tab) {
   return content.length ? content[content.length - 1].endIndex : 2;
 }
 
-// --- Meta tab ------------------------------------------------------------------
+// --- Meta tab (config only) ------------------------------------------------------
 
 export function parseMeta(tab) {
   const text = tabText(tab).trim();
@@ -87,12 +124,16 @@ export function metaRewriteRequests(tab, meta) {
   return requests;
 }
 
-// --- Inline HTML -> styled segments ------------------------------------------------
+// --- Styled segments: the canonical inline representation ---------------------------
+// A segment is {text, style:{bold,italic,underline,strike,code,link}}. Both the
+// HTML side (editor/model) and the Docs side (textRuns) reduce to segments;
+// canonical HTML is emitted from merged segments with a fixed tag order, so
+// equivalent content always produces identical bytes (and identical hashes).
 
-function inlineToSegments(html) {
+function segmentsFromHtml(html) {
   const div = document.createElement("div");
   div.innerHTML = html || "";
-  const segments = []; // {text, style:{bold,italic,underline,strike,code,link}}
+  const segments = [];
   const walk = (node, style) => {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
@@ -106,7 +147,10 @@ function inlineToSegments(html) {
         else if (tag === "u") s.underline = true;
         else if (tag === "s" || tag === "del") s.strike = true;
         else if (tag === "code") s.code = true;
-        else if (tag === "a") s.link = child.getAttribute("href") || null;
+        else if (tag === "a") {
+          const href = child.getAttribute("href") || "";
+          if (/^https?:\/\//.test(href)) s.link = href;
+        }
         walk(child, s);
       }
     }
@@ -115,9 +159,53 @@ function inlineToSegments(html) {
   return segments;
 }
 
-function segmentsText(segments) {
-  return segments.map((s) => s.text).join("");
+function segmentsFromRuns(runs) {
+  const segments = [];
+  for (const run of runs) {
+    const ts = run.textStyle || {};
+    const text = run.content.replace(/\n$/, "");
+    if (!text) continue;
+    const style = {};
+    if (ts.bold) style.bold = true;
+    if (ts.italic) style.italic = true;
+    if (ts.underline && !ts.link) style.underline = true;
+    if (ts.strikethrough) style.strike = true;
+    if ((ts.weightedFontFamily?.fontFamily || "").includes("Courier")) style.code = true;
+    if (ts.link?.url && /^https?:\/\//.test(ts.link.url)) style.link = ts.link.url;
+    segments.push({ text, style });
+  }
+  return segments;
 }
+
+const styleKey = (s) =>
+  `${s.bold ? "b" : ""}${s.italic ? "i" : ""}${s.underline ? "u" : ""}${s.strike ? "s" : ""}${s.code ? "c" : ""}|${s.link || ""}`;
+
+function mergeSegments(segments) {
+  const out = [];
+  for (const seg of segments) {
+    const last = out[out.length - 1];
+    if (last && styleKey(last.style) === styleKey(seg.style)) last.text += seg.text;
+    else out.push({ text: seg.text, style: { ...seg.style } });
+  }
+  return out;
+}
+
+function htmlFromSegments(segments) {
+  // Fixed nesting order: a > strong > em > u > s > code (innermost).
+  return segments.map(({ text, style }) => {
+    let html = escapeHtml(text).replace(/\u000b/g, "<br>");
+    if (style.code) html = `<code>${html}</code>`;
+    if (style.strike) html = `<s>${html}</s>`;
+    if (style.underline) html = `<u>${html}</u>`;
+    if (style.italic) html = `<em>${html}</em>`;
+    if (style.bold) html = `<strong>${html}</strong>`;
+    if (style.link) html = `<a href="${escapeHtml(style.link)}">${html}</a>`;
+    return html;
+  }).join("");
+}
+
+export const canonicalInline = (html) =>
+  htmlFromSegments(mergeSegments(segmentsFromHtml(html)));
 
 function textStyleFor(style, isCodeBlock) {
   const ts = {};
@@ -126,7 +214,7 @@ function textStyleFor(style, isCodeBlock) {
   if (style.italic) { ts.italic = true; fields.push("italic"); }
   if (style.underline) { ts.underline = true; fields.push("underline"); }
   if (style.strike) { ts.strikethrough = true; fields.push("strikethrough"); }
-  if (style.link && /^https?:\/\//.test(style.link)) { ts.link = { url: style.link }; fields.push("link"); }
+  if (style.link) { ts.link = { url: style.link }; fields.push("link"); }
   if (style.code && !isCodeBlock) {
     ts.weightedFontFamily = { fontFamily: CODE_FONT };
     ts.backgroundColor = GRAY;
@@ -138,14 +226,13 @@ function textStyleFor(style, isCodeBlock) {
 // --- Blocks -> Docs requests ---------------------------------------------------------
 
 function blockRenderPlan(block) {
-  // Returns {text, styleRuns:[{offset, length, style}], indentTabs}
   let segments;
   if (block.type === "code") {
     const div = document.createElement("div");
     div.innerHTML = block.html;
     segments = [{ text: div.textContent.replace(/\n/g, "\u000b"), style: {} }];
   } else {
-    segments = inlineToSegments(block.html);
+    segments = mergeSegments(segmentsFromHtml(block.html));
   }
   const indentTabs = block.type === "list_item" ? Math.max(Math.floor(block.attrs?.indent) || 0, 0) : 0;
   const prefix = "\t".repeat(indentTabs);
@@ -157,7 +244,7 @@ function blockRenderPlan(block) {
     }
     offset += seg.text.length;
   }
-  return { text: prefix + segmentsText(segments), styleRuns, indentTabs };
+  return { text: prefix + segments.map((s) => s.text).join(""), styleRuns };
 }
 
 function paragraphStyleRequest(block, range) {
@@ -180,10 +267,9 @@ function paragraphStyleRequest(block, range) {
 
 const RESET_FIELDS = "bold,italic,underline,strikethrough,link,weightedFontFamily,backgroundColor";
 
-export function fullTabRewriteRequests(tab, blocks) {
+export function fullTabRewriteRequests(tab, blocks, nameFor) {
   // Replace a language tab's entire body with the rendered blocks and fresh
-  // babel:<id> named ranges. All indices are computed against the state the
-  // tab will be in after the preceding requests in this same batch.
+  // named ranges (nameFor(block) supplies babel:<id>:<own>:<src>).
   const tabId = tab.tabProperties.tabId;
   const requests = [];
 
@@ -202,15 +288,14 @@ export function fullTabRewriteRequests(tab, blocks) {
   const fullText = plans.map((p) => p.text).join("\n");
   requests.push({ insertText: { location: { index: 1, tabId }, text: fullText } });
 
-  // Per-block spans within the inserted text (before bullets eat the tabs).
   let pos = 1;
   const spans = plans.map((p) => {
     const start = pos;
-    pos += p.text.length + 1; // + newline
-    return { start, end: start + p.text.length }; // content span, excl. newline
+    pos += p.text.length + 1;
+    return { start, end: start + p.text.length };
   });
 
-  const bulletRuns = []; // {start, end, ordered}
+  const bulletRuns = [];
   blocks.forEach((block, i) => {
     const { start, end: contentEnd } = spans[i];
     const styleRange = { startIndex: start, endIndex: Math.max(contentEnd, start + 1), tabId };
@@ -234,10 +319,9 @@ export function fullTabRewriteRequests(tab, blocks) {
         } });
       }
     }
-    // Named range includes the trailing newline so it survives content rewrites.
     const nrEnd = i === blocks.length - 1 ? 1 + fullText.length + 1 : spans[i + 1].start;
     requests.push({ createNamedRange: {
-      name: RANGE_PREFIX + block.id,
+      name: nameFor(block),
       range: { startIndex: start, endIndex: nrEnd, tabId },
     } });
     if (block.type === "list_item") {
@@ -262,10 +346,11 @@ export function fullTabRewriteRequests(tab, blocks) {
   return requests;
 }
 
-export function singleBlockRewriteRequests(tab, block, span) {
+export function singleBlockRewriteRequests(tab, block, span, name, oldNames) {
   // Content-only rewrite of one block inside its existing paragraph. `span` is
   // the block's current named-range span [start, end) (newline included).
-  // Keeps paragraph-level style and bullets; replaces text and inline styles.
+  // Keeps paragraph-level style and bullets; replaces text, inline styles, and
+  // the named range (whose name carries the new hashes).
   const tabId = tab.tabProperties.tabId;
   const [start, end] = span;
   const requests = [];
@@ -296,11 +381,11 @@ export function singleBlockRewriteRequests(tab, block, span) {
       }
     }
   }
-  // Recreate the named range with exact bounds (insertion at a range boundary
-  // doesn't reliably extend it).
-  requests.push({ deleteNamedRange: { name: RANGE_PREFIX + block.id, tabsCriteria: { tabIds: [tabId] } } });
+  for (const old of oldNames || []) {
+    requests.push({ deleteNamedRange: { name: old, tabsCriteria: { tabIds: [tabId] } } });
+  }
   requests.push({ createNamedRange: {
-    name: RANGE_PREFIX + block.id,
+    name,
     range: { startIndex: start, endIndex: start + plan.text.length + 1, tabId },
   } });
   return requests;
@@ -308,40 +393,27 @@ export function singleBlockRewriteRequests(tab, block, span) {
 
 // --- Docs tab -> blocks -----------------------------------------------------------
 
-function runToHtml(run) {
-  const ts = run.textStyle || {};
-  let html = escapeHtml(run.content.replace(/\n$/, "")).replace(/\u000b/g, "<br>");
-  if (!html) return "";
-  const isCode = (ts.weightedFontFamily?.fontFamily || "").includes("Courier");
-  if (isCode) html = `<code>${html}</code>`;
-  if (ts.strikethrough) html = `<s>${html}</s>`;
-  if (ts.underline && !ts.link) html = `<u>${html}</u>`;
-  if (ts.italic) html = `<em>${html}</em>`;
-  if (ts.bold) html = `<strong>${html}</strong>`;
-  if (ts.link?.url) html = `<a href="${escapeHtml(ts.link.url)}">${html}</a>`;
-  return html;
-}
-
 export function parseLanguageTab(tab) {
-  // Returns {blocks: [{id|null, type, attrs, html}], spans: Map(id -> [s,e))}
+  // Returns {blocks, spans}. Each block: {id|null, own|null, src|null, name,
+  // type, attrs, html (canonical), hash (actual)}; spans: id -> [s, e).
   const documentTab = tab.documentTab;
   const lists = documentTab.lists || {};
 
-  // Named ranges: babel:<id> -> covered spans (may fragment after edits).
+  // babel named ranges: id -> {name, own, src, spans:[[s,e)...]}
   const rangesById = new Map();
   for (const [name, group] of Object.entries(documentTab.namedRanges || {})) {
-    if (!name.startsWith(RANGE_PREFIX)) continue;
-    const id = name.slice(RANGE_PREFIX.length);
+    const parsed = parseRangeName(name);
+    if (!parsed) continue;
     for (const nr of group.namedRanges || []) {
       for (const r of nr.ranges || []) {
-        if (!rangesById.has(id)) rangesById.set(id, []);
-        rangesById.get(id).push([r.startIndex ?? 0, r.endIndex]);
+        if (!rangesById.has(parsed.id)) rangesById.set(parsed.id, { ...parsed, name, spans: [] });
+        rangesById.get(parsed.id).spans.push([r.startIndex ?? 0, r.endIndex]);
       }
     }
   }
-  const idAt = (index) => {
-    for (const [id, spans] of rangesById) {
-      for (const [s, e] of spans) if (index >= s && index < e) return id;
+  const rangeAt = (index) => {
+    for (const info of rangesById.values()) {
+      for (const [s, e] of info.spans) if (index >= s && index < e) return info;
     }
     return null;
   };
@@ -355,7 +427,6 @@ export function parseLanguageTab(tab) {
     const ps = p.paragraphStyle || {};
     const runs = (p.elements || []).filter((pe) => pe.textRun).map((pe) => pe.textRun);
     const plain = runs.map((r) => r.content).join("").replace(/\n$/, "");
-    let html = runs.map(runToHtml).join("");
 
     let type = "paragraph", attrs = {};
     const named = ps.namedStyleType || "NORMAL_TEXT";
@@ -371,27 +442,31 @@ export function parseLanguageTab(tab) {
       attrs = { level: Math.min(parseInt(named.slice(8), 10), 3) };
     } else if (shaded) {
       type = "code";
-      html = escapeHtml(plain.replace(/\u000b/g, "\n"));
     } else if ((ps.indentStart?.magnitude || 0) >= 18) {
       type = "blockquote";
     }
+    const html = type === "code"
+      ? escapeHtml(plain.replace(/\u000b/g, "\n"))
+      : htmlFromSegments(mergeSegments(segmentsFromRuns(runs)));
 
-    let id = idAt(el.startIndex);
-    if (id && usedIds.has(id)) id = null; // fragmented range: keep first claim
+    const info = rangeAt(el.startIndex);
+    let id = info && !usedIds.has(info.id) ? info.id : null;
     if (id) {
       usedIds.add(id);
       spans.set(id, [el.startIndex, el.endIndex]);
     }
-    blocks.push({ id, type, attrs, html });
+    blocks.push({
+      id,
+      own: id ? info.own : null,
+      src: id ? info.src : null,
+      name: id ? info.name : null,
+      type, attrs, html,
+      hash: blockHash(type, attrs, html),
+    });
   }
   // Drop a single trailing unregistered empty paragraph (Docs' mandatory final
   // newline shows up as one when the last block's named range got clipped).
   const last = blocks[blocks.length - 1];
   if (blocks.length && !last.id && !last.html) blocks.pop();
   return { blocks, spans };
-}
-
-export function assignIds(blocks) {
-  for (const b of blocks) if (!b.id) b.id = newId();
-  return blocks;
 }

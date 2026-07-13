@@ -144,26 +144,19 @@ export function renameTab(docId, tabId, title) {
 // --- Drive API ------------------------------------------------------------------
 
 export function getFileMeta(docId) {
-  // version bumps on every content change — the cheap poll target.
-  return gfetch(`${DRIVE}/files/${docId}?fields=version,name,capabilities(canEdit,canComment)`);
+  // version bumps on every change — the cheap poll target. appProperties is
+  // the invisible per-app key-value store where translation locks live, so
+  // lock state rides along with every poll for free.
+  return gfetch(`${DRIVE}/files/${docId}?fields=version,name,capabilities(canEdit),appProperties`);
 }
 
-export function listComments(docId) {
-  return gfetch(
-    `${DRIVE}/files/${docId}/comments?fields=comments(id,content,createdTime,author(displayName,me))&pageSize=100`,
-  ).then((r) => r.comments || []);
-}
-
-export function createComment(docId, content) {
-  return gfetch(`${DRIVE}/files/${docId}/comments?fields=id,createdTime`, {
-    method: "POST",
-    body: JSON.stringify({ content }),
+export function setAppProperties(docId, props) {
+  // Per-key patch: {key: value} sets, {key: null} deletes. Concurrent patches
+  // of different keys both survive.
+  return gfetch(`${DRIVE}/files/${docId}?fields=appProperties`, {
+    method: "PATCH",
+    body: JSON.stringify({ appProperties: props }),
   });
-}
-
-export function deleteComment(docId, commentId) {
-  return gfetch(`${DRIVE}/files/${docId}/comments/${commentId}`, { method: "DELETE" })
-    .catch((err) => { if (err.status !== 404) throw err; });
 }
 
 // --- URL helpers ------------------------------------------------------------------

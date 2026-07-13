@@ -25,19 +25,25 @@ python3 -m http.server 8100   # then open http://localhost:8100
 - `static/vendor/prosemirror.js` - Committed ESM bundle (rebuild with esbuild
   from prosemirror-* packages if upgrading; no runtime CDN dependency).
 
-## Architecture
-The Google Doc is the database. `babel:meta` tab = canonical model JSON
-(languages incl. tabId, apiKey, usage, blocks `{id, type, attrs,
-content: {lang: html}, source, pending, prev_html}`). One tab per language =
-rendered view (one block per paragraph; named range `babel:<id>` carries the
-block id, spanning the paragraph incl. its trailing newline). Clients poll the
-Drive file `version` every 500ms and refetch the doc on change. Edits (from
-this app or typed directly in Google Docs) are merged by block id
-(`mergeBlocks`); changed blocks become the new source and are retranslated
-sentence-by-sentence. Translation mutual exclusion uses `[babel-lock]` Drive
-comments (2 min TTL); human comments are never touched. All writes are
-serialized through `writeChain` and always end with a snapshot refetch so
-indices are never computed against a stale doc.
+## Architecture (storage v2)
+The Google Doc is the database, without duplicated content. One tab per
+language = the only store of text (one block per paragraph). Named ranges
+`babel:<id>:<ownHash>:<srcHash>` carry block identity + sync state: ownHash =
+hash of the block's content in that tab at last app write (actual != own =>
+external edit => reconcile/repair); srcHash = hash of the source content a
+translation was made from (src != source tab's actual hash => stale =>
+pending); own == src marks the source language. Hashes are FNV-1a over a
+canonical form (docmodel `blockHash`/`canonicalInline`) so Docs run-splitting
+and tag ordering never look like edits. `babel:meta` tab = config only
+(languages incl. tabId, apiKey, model, usage). The in-memory model
+(`deriveModel` in app.js) is rebuilt from the tabs on every pull; pending is
+derived, never stored. prev_html for sentence-diffing is in-memory only
+(`prevHtmlById`) — a dead client costs one whole-block retranslation.
+Translation locks are Drive `appProperties` (`lock_<blockId>` =
+`clientId:ts`, 2 min TTL, invisible, per-key patches) read on the 500ms
+metadata poll. Writes are serialized through `writeChain`, conditioned on
+`writeControl.requiredRevisionId`, rebuilt+retried on conflict, and end with
+a snapshot refetch.
 
 ## Invariants to keep
 - Block ids are stable across edits, type toggles, and list wrap/lift
@@ -48,7 +54,8 @@ indices are never computed against a stale doc.
 - Multi-request batchUpdates must account for index shifts: bullets are
   created last and bottom-up (they consume leading tabs); single-block
   rewrites are applied bottom-up.
-- Only touch comments whose content starts with `[babel-lock]`.
+- Locks live in appProperties only; never write user-visible artifacts
+  (comments) for coordination.
 
 ## Testing
 Pure logic and the Docs conversion layer have node tests (jsdom for the DOM

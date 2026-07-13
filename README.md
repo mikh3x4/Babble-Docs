@@ -14,23 +14,25 @@ the browser with the signed-in user's own OAuth token.
 
 ## How it works
 
-- **The Google Doc is the storage.** A tab named `babel:meta` holds a JSON
-  blob: the language list, the Anthropic API key, the translation cost
-  counters, and the canonical block model. One additional tab per language
-  holds the rendered, human-readable document — open the doc in Google Docs
-  and you can read every translation directly.
-- **Block identity** is tracked with Docs named ranges (`babel:<id>`), so
-  blocks keep their translations when text moves around. Edits made directly
-  in Google Docs are picked up too and retranslated.
+- **The Google Doc is the storage — with no duplicated content.** One tab per
+  language holds the rendered, human-readable document; a small `babel:meta`
+  tab holds only config (languages, the Anthropic API key, cost counters).
+- **Block identity and sync state live in invisible named ranges**
+  (`babel:<id>:<ownHash>:<srcHash>`). A block's text hash not matching its
+  range name means it was edited outside the app (picked up and retranslated);
+  a translation whose `srcHash` no longer matches the source block's hash is
+  stale. All state is derivable from the doc itself and self-heals.
 - **Sentence-level translation**: only the sentences you actually edited are
   retranslated (Claude Sonnet, called straight from the browser) — the
   surrounding paragraph and neighboring blocks ride along as context.
-- **Coordination via comments**: while a client translates a block it holds a
-  `[babel-lock]` Drive comment on the file; other clients back off. Lock
-  comments are deleted when translation finishes (or expire after 2 minutes);
-  human comments are never touched.
-- **Sync** is polling: clients poll the Drive file version (~2×/s, cheap) and
-  refetch the doc only when it changed.
+- **Coordination via invisible Drive `appProperties`**: while a client
+  translates a block it holds a `lock_<id>` app property on the file; other
+  clients back off and highlight the block. Locks are invisible to users
+  (nothing in the doc, no comments), expire after 2 minutes, and propagate
+  with the regular 500ms metadata poll.
+- **Sync** is polling: clients poll Drive file metadata (~2×/s, cheap; also
+  carries the locks) plus the Docs `revisionId` (1/s) and refetch the doc
+  only when content actually changed.
 
 ## Using it
 
