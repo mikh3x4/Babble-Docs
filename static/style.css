@@ -144,6 +144,11 @@ body {
   background: #dcfce7; border-radius: 3px;
   transition: background .4s;
 }
+/* Simultaneous edits by two people were just merged by Claude. */
+.ProseMirror .merged {
+  background: #f3e8ff; border-radius: 3px;
+  transition: background .4s;
+}
 /* Placeholder where newly added text will appear once translated. */
 .ProseMirror .incoming-gap {
   background: #fef3c7; border-radius: 3px; padding: 0 10px; margin: 0 2px;

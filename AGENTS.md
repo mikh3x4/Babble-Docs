@@ -25,31 +25,32 @@ python3 -m http.server 8100   # then open http://localhost:8100
 - `static/vendor/prosemirror.js` - Committed ESM bundle (rebuild with esbuild
   from prosemirror-* packages if upgrading; no runtime CDN dependency).
 
-## Architecture (storage v3, two-tier)
+## Architecture (paragraph blocks + hashed ranges)
 The Google Doc is the database, without duplicated content. One tab per
-language = the only store of text. PARAGRAPHS are the structural unit (one
-Docs paragraph each; heading/list/indent attrs; identity via named range
-`babelp:<pid>:<attrsHash>`). SENTENCES are the sync/merge/translation unit:
-each sentence span carries `babel:<sid>:<ownHash>:<srcHash>` (own = hash at
-last app write, actual!=own => external edit => reconcile; src = hash of the
-source sentence a translation was made from, mismatch => stale => pending;
-own==src marks the source language, dual claims tie-broken by srcHash votes).
-Segmentation in translated tabs is DEFINED by the ranges; sentence heuristics
-(core `splitSentencesHtml`) only run on the language being edited. Editing:
-the editor stays paragraph-based; `sendUpdate` flat-diffs displayed vs editor
-sentences (`computeSentenceMerge`: equal keeps sid even across paragraph
-splits, edited reuses the replaced sid, inserts mint sids) into INTENTS,
-applied to the model (`applyIntents`) and written as paragraph-content
-rewrites in the edited tab only. Writes are serialized, conditioned on
-`writeControl.requiredRevisionId`; on conflict the model is re-derived from
-the fresh doc (`buildModel`) and the intents re-applied — this is what makes
-two clients editing different sentences of the same paragraph merge. Sentence
-order across tabs is anchor-merged (`mergeSidSequences`). Translation is per
-sentence (paragraph both-language context in the prompt), locked via
-invisible Drive appProperties `lock_<sid>` (2 min TTL) taken at edit time and
-read on the 500ms metadata poll. Highlights: yellow `.pending` = incoming
-replacement span, blue `.outgoing` = source span being translated,
-`.incoming-gap` widget = untranslated insert. `babel:meta` tab = config only.
+language = the only store of text; one BLOCK = one Docs paragraph, tracked by
+an invisible named range `babel:<id>:<ownHash>:<srcHash>` (own = hash of the
+block's canonical content at last app write, actual!=own => external edit =>
+reconcile; src = hash of the source content a translation was made from,
+mismatch => stale => pending; own==src marks the source language, dual claims
+tie-broken by srcHash votes). Hashes are FNV-1a over a canonical inline form
+so Docs run-splitting/tag order never look like edits. `babel:meta` tab =
+config only. The model (deriveModel) is rebuilt from the tabs on every pull.
+Translation is sentence-diffed WITHIN a block (planSentenceUpdates; prev_html
+in-memory only), locked via invisible appProperties `lock_<blockId>` taken at
+edit time; the lock value carries sentence indices so other clients highlight
+only affected sentences. Writes are serialized, conditioned on
+writeControl.requiredRevisionId, retried 5x with backoff. CONFLICTS: before
+writing, resolveConflicts compares the tab's current text against editBase
+(what the local edit started from) — a genuine simultaneous edit of the same
+paragraph in the same language is three-way merged by Claude
+(T.mergeParagraphs) with a purple highlight, then retranslated. Highlights:
+green .editing = your held edit (fires ~1s after typing pauses), blue
+.outgoing = being translated out, yellow .pending = incoming replacement,
+purple .merged = simultaneous edits just merged, .incoming-gap = insert
+placeholder. Long paragraphs (>900 chars) get a one-time warning toast —
+paragraphs are the sync/merge unit. Polling: Drive metadata every 500ms
+(locks ride along); Docs revisionId probed every tick while active, every 2s
+idle.
 
 ## Invariants to keep
 - Block ids are stable across edits, type toggles, and list wrap/lift

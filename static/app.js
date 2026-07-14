@@ -1,15 +1,14 @@
 // Babbel Docs frontend: ProseMirror editor synced to a Google Doc.
 //
-// The Google Doc is the database (storage v3, two-tier): language tabs are
-// the only store of text; paragraphs carry identity/structure in babelp:
-// named ranges; SENTENCES are the sync unit, each with a babel:<sid> range
-// whose name carries ownHash (consistency) + srcHash (staleness). The meta
-// tab holds config/cost only. This client polls Drive metadata (locks ride
-// along) and the Docs revisionId, rebuilds the model from the tabs on every
-// pull, diffs local edits into per-sentence intents (re-applied on write
-// conflicts, which is what makes concurrent same-paragraph edits merge), and
-// translates changed sentences with Claude, locked per sentence via
-// invisible appProperties.
+// The Google Doc is the database: a `babel:meta` tab holds the canonical block
+// model (JSON: languages, API key, usage, per-language content + pending
+// flags); one tab per language holds the rendered document, with named ranges
+// carrying block ids. This client polls the Drive file version (~2Hz), pulls
+// the doc on change, merges edits (from other clients or from people typing
+// directly in Google Docs), translates changed sentences with Claude, and
+// writes results back. Translation work is locked via `[babel-lock]` Drive
+// comments so concurrent clients don't translate the same block twice; human
+// comments are left alone.
 
 import {
   EditorState, Plugin, PluginKey, TextSelection,
@@ -28,7 +27,7 @@ import * as D from "./docmodel.js";
 import * as T from "./translate.js";
 import {
   LANGUAGE_CATALOG, newId, escapeHtml, sanitizeInlineHtml, stripTags,
-  splitSentencesHtml, computeSentenceMerge, mergeSidSequences,
+  mergeBlocks, renderBlocks, blockContext, diffSentenceIndices, sentencePlainOffsets,
 } from "./core.js";
 
 // --- Schema -----------------------------------------------------------------
@@ -226,10 +225,12 @@ const idPlugin = new Plugin({
   },
 });
 
-// Translation-state decorations. Input: Map(pid -> {sentsIn, sentsOut, ins}):
-// sentsIn (yellow) = spans an incoming translation will replace; sentsOut
-// (blue) = spans being translated outward; ins = offsets where newly added,
-// not-yet-translated text will appear (blank-space placeholder widgets).
+// Translation-state decorations. Input: Map(blockId -> mark) where mark is
+//   {kind: "in"|"out", all: true}                  whole-block highlight
+//   {kind, sents: [[s,e],...], ins: [offset,...]}  sentence-level highlight
+// "in" (yellow) = incoming translation will replace this text; "out" (blue) =
+// this text is being translated outward; ins = blank-space placeholders where
+// newly added text will appear.
 const pendingKey = new PluginKey("pending");
 
 function gapWidget() {
@@ -257,26 +258,29 @@ const pendingPlugin = new Plugin({
         if (inItem) return false;
         const m = marks.get(node.attrs.id);
         if (m) {
-          // The text lives in the node itself, except list items, where it
-          // lives in the first (paragraph) child.
-          let textNode = node, textPos = pos;
-          if (node.type.name === "list_item" && node.firstChild) {
-            textNode = node.firstChild;
-            textPos = pos + 1;
-          }
-          const base = textPos + 1;
-          const max = textNode.content.size;
-          const push = (ranges, cls) => {
-            for (const [s, e] of ranges || []) {
+          const cls = m.kind === "out" ? "outgoing"
+            : m.kind === "editing" ? "editing"
+            : m.kind === "merged" ? "merged"
+            : "pending";
+          if (m.all) {
+            decos.push(Decoration.node(pos, pos + node.nodeSize, { class: cls }));
+          } else {
+            // The text lives in the node itself, except list items, where it
+            // lives in the first (paragraph) child.
+            let textNode = node, textPos = pos;
+            if (node.type.name === "list_item" && node.firstChild) {
+              textNode = node.firstChild;
+              textPos = pos + 1;
+            }
+            const base = textPos + 1;
+            const max = textNode.content.size;
+            for (const [s, e] of m.sents || []) {
               const a = Math.min(s, max), b = Math.min(e, max);
               if (b > a) decos.push(Decoration.inline(base + a, base + b, { class: cls }));
             }
-          };
-          push(m.sentsIn, "pending");
-          push(m.sentsOut, "outgoing");
-          push(m.sentsEditing, "editing");
-          for (const off of m.ins || []) {
-            decos.push(Decoration.widget(base + Math.min(off, max), gapWidget, { side: -1 }));
+            for (const off of m.ins || []) {
+              decos.push(Decoration.widget(base + Math.min(off, max), gapWidget, { side: -1 }));
+            }
           }
         }
         return true;
@@ -338,12 +342,12 @@ let docId = null;
 let docName = "";
 let canEdit = false;
 let lang = null;
-let model = null;              // {languages, apiKey, model, usage, paras, sents(Map)}
+let model = null;              // parsed babel:meta JSON — the canonical document model
 let docSnapshot = null;        // last fetched documents.get result
 let lastVersion = null;        // Drive file version we've already pulled
 let lastRevision = null;       // Docs revisionId we've already pulled
 let pollTick = 0;
-let lastReceived = new Map();  // pid -> {html, sig, sents:[{sid, html}]} last rendered for our lang
+let lastReceived = new Map();  // block id -> {html, sig} last rendered for our lang
 let sendTimer = null;
 let applyingRemote = false;
 let skippedRemote = false;
@@ -351,27 +355,26 @@ let pollTimer = null;
 let writeChain = Promise.resolve();
 let writing = false;
 let queuedWrites = 0;
-let lockedSids = new Set();    // sentence ids other clients are translating
-let currentIntents = null;     // latest unwritten local edits (re-applied on write conflicts)
+let lockedBlocks = new Set();      // block ids locked by other clients (being translated)
 const clientId = newId();
-const translateTimers = new Map(); // sid -> timeout
-const heldSids = new Set();        // sids edited locally, translation held until typing pauses (green)
-const heldLocks = new Set();       // sids we hold appProperties locks for
+const translateTimers = new Map(); // blockId -> timeout
+const heldBlocks = new Set();      // blocks edited locally, translation held until typing pauses (green)
+const heldLocks = new Set();       // blockIds we hold appProperties locks for
+const editBase = new Map();        // blockId -> html displayed before the local edit (conflict base)
+const mergedBlocks = new Set();    // blocks just merged by Claude (purple highlight)
+const warnedLong = new Set();      // blocks already warned about length
+let lastActivityAt = 0;            // recent doc activity => poll content faster
+const LONG_BLOCK_CHARS = 900;
+const prevHtmlById = new Map();    // blockId -> pre-edit source html (in-memory only, for sentence diffing)
+const sentenceState = new Map();   // blockId -> {n, d, ins} sentence-level change info (own edits + others' locks)
 
 const sigOf = (b) => `${b.type}|${JSON.stringify(b.attrs || {})}`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const langName = (code) => model?.languages.find((l) => l.code === code)?.name || code;
 const langTab = (code) => {
   const entry = model?.languages.find((l) => l.code === code);
   return entry && docSnapshot ? D.tabById(docSnapshot, entry.tabId) : null;
 };
-const isShared = (paraType, html) => paraType === "code" || !stripTags(html || "").trim();
-
-function plainLen(html, isCode) {
-  // Length of html's text as ProseMirror counts it (<br> = 1 position).
-  const div = document.createElement("div");
-  div.innerHTML = html || "";
-  return div.textContent.length + (isCode ? 0 : div.querySelectorAll("br").length);
-}
 
 function toast(message, isError = false) {
   els.toast.textContent = message;
@@ -405,33 +408,46 @@ function updateCost() {
 function updateTranslating() {
   let any = false;
   if (model) {
-    for (const sid of lockedSids) if (model.sents.has(sid)) { any = true; break; }
-    if (!any) {
-      for (const s of model.sents.values()) if (s.pending?.length) { any = true; break; }
-    }
+    const ids = new Set(model.blocks.map((b) => b.id));
+    for (const sid of lockedBlocks) if (ids.has(sid)) { any = true; break; }
+    if (!any) any = model.blocks.some((b) => b.pending?.length);
   }
   els.translating.hidden = !any;
 }
 
-function decorationInput(blocks) {
-  // Per paragraph: sentence spans to highlight in the current view. Yellow
-  // (in) = an incoming translation will replace this; blue (out) = this is
-  // being translated outward; ins = placeholders for untranslated inserts.
+function decorationInput(rendered) {
+  // For every block awaiting/undergoing translation, decide what to highlight
+  // in the current view: outgoing (blue) sentences in the source language,
+  // incoming (yellow) sentences + insertion gaps in target languages. Without
+  // sentence info (no history / unaligned), fall back to the whole block.
+  const blockById = new Map(model.blocks.map((b) => [b.id, b]));
   const map = new Map();
-  for (const b of blocks) {
-    const sentsIn = [], sentsOut = [], sentsEditing = [], ins = [];
-    for (const pc of b.pieces || []) {
-      if (pc.gap) { ins.push(pc.at); continue; }
-      const s = model.sents.get(pc.sid);
-      const locked = lockedSids.has(pc.sid);
-      const out = pc.outgoing || (locked && s?.source === lang);
-      const inc = pc.pending || (locked && s?.source !== lang);
-      if (out && heldSids.has(pc.sid)) sentsEditing.push([pc.start, pc.end]); // you're writing: held
-      else if (out) sentsOut.push([pc.start, pc.end]);
-      else if (inc) sentsIn.push([pc.start, pc.end]);
-    }
-    if (sentsIn.length || sentsOut.length || sentsEditing.length || ins.length) {
-      map.set(b.id, { sentsIn, sentsOut, sentsEditing, ins });
+  for (const rb of rendered) {
+    const blk = blockById.get(rb.id);
+    if (mergedBlocks.has(rb.id)) { map.set(rb.id, { kind: "merged", all: true }); continue; }
+    const active = lockedBlocks.has(rb.id) || !!rb.pending || !!blk?.pending?.length;
+    if (!active || !blk) continue;
+    const st = sentenceState.get(rb.id);
+    const offsets = () => sentencePlainOffsets(rb.html);
+    if (lang === blk.source) {
+      const kind = heldBlocks.has(rb.id) ? "editing" : "out"; // green while you write, blue while it translates
+      if (st?.n?.length) {
+        const off = offsets();
+        map.set(rb.id, { kind, sents: st.n.filter((i) => i < off.length).map((i) => off[i]) });
+      } else {
+        map.set(rb.id, { kind, all: true });
+      }
+    } else if ((blk.pending || []).includes(lang) || lockedBlocks.has(rb.id)) {
+      if (st && (st.d?.length || st.ins?.length)) {
+        const off = offsets();
+        map.set(rb.id, {
+          kind: "in",
+          sents: (st.d || []).filter((i) => i < off.length).map((i) => off[i]),
+          ins: (st.ins || []).map((i) => (i < off.length ? off[i][0] : (off[off.length - 1]?.[1] ?? 0))),
+        });
+      } else {
+        map.set(rb.id, { kind: "in", all: true });
+      }
     }
   }
   return map;
@@ -476,130 +492,110 @@ function sendUpdate() {
   sendTimer = null;
   if (!view || !model || !canEdit) return;
   const blocks = docToBlocks(view.state.doc);
-  let changed = blocks.length !== lastReceived.size;
-  for (const b of blocks) {
+  let changed = false;
+  const payload = blocks.map((b) => {
     const prev = lastReceived.get(b.id);
-    if (!prev || prev.html !== b.html || prev.sig !== sigOf(b)) { changed = true; break; }
-  }
-  if (!(changed || skippedRemote)) return;
+    const sig = sigOf(b);
+    if (prev && prev.html === b.html) {
+      // Text untouched: omit html so the merge keeps all translations, but
+      // type/attrs changes (heading toggle, list indent) still count as edits.
+      if (prev.sig !== sig) changed = true;
+      prev.sig = sig;
+      return { id: b.id, type: b.type, attrs: b.attrs };
+    }
+    changed = true;
+    if (prev && !editBase.has(b.id)) editBase.set(b.id, prev.html); // conflict base: what we edited FROM
+    lastReceived.set(b.id, { html: b.html, sig });
+    return b;
+  });
+  const removed = lastReceived.size !== blocks.length;
+  if (!(changed || removed || skippedRemote)) return;
   skippedRemote = false;
-
-  // Flat sentence diff (old displayed vs editor) assigns sentence ids: equal
-  // sentences keep their id (even across paragraph splits/merges), edited
-  // ones reuse the id they replace, added ones get fresh ids.
-  const oldFlat = [];
-  for (const rec of lastReceived.values()) {
-    for (const s of rec.sents || []) oldFlat.push({ sid: s.sid, html: s.html });
-  }
-  const newFlat = [];
-  for (const b of blocks) {
-    const clean = b.type === "code" ? b.html : sanitizeInlineHtml(b.html);
-    const parts = b.type === "code" ? [clean] : splitSentencesHtml(clean);
-    for (const part of parts) newFlat.push({ pid: b.id, html: part });
-  }
-  const merge = computeSentenceMerge(oldFlat, newFlat);
-
-  const newParas = blocks.map((b) => ({ pid: b.id, type: b.type, attrs: b.attrs, sents: [] }));
-  const byPid = new Map(newParas.map((p) => [p.pid, p]));
-  for (const s of merge.sents) byPid.get(s.pid).sents.push(s);
-
-  // Structural change: paragraph list changed, or a kept sentence moved to a
-  // different paragraph (split/merge) — all tabs must be rewritten.
-  const oldStruct = model.paras.map((p) => `${p.pid}|${sigOf(p)}`).join(",");
-  const newStruct = blocks.map((b) => `${b.id}|${sigOf(b)}`).join(",");
-  let structural = oldStruct !== newStruct;
-  if (!structural) {
-    const oldPidOfSid = new Map();
-    for (const p of model.paras) for (const sid of p.sids) oldPidOfSid.set(sid, p.pid);
-    for (const s of merge.sents) {
-      if (s.sid && !s.changed && oldPidOfSid.has(s.sid) && oldPidOfSid.get(s.sid) !== s.pid) {
-        structural = true; break;
-      }
+  const ids = new Set(blocks.map((b) => b.id));
+  for (const id of [...lastReceived.keys()]) {
+    if (!ids.has(id)) {
+      lastReceived.delete(id);
+      // A dirty block that got deleted must not pin its lock (and everyone's
+      // "Translating…" badge) until the TTL.
+      clearTimeout(translateTimers.get(id));
+      translateTimers.delete(id);
+      heldBlocks.delete(id);
+      editBase.delete(id);
+      if (heldLocks.has(id)) releaseLock(id);
     }
   }
 
-  const intents = { lang, structural, newParas, removed: merge.removed };
-  currentIntents = intents;
-  const { dirtySids, plan } = applyIntents(model, intents);
-  for (const sid of merge.removed) {
-    // A dirty sentence that got deleted would otherwise pin its lock (and
-    // everyone's "Translating…" badge) until the TTL.
-    clearTimeout(translateTimers.get(sid));
-    translateTimers.delete(sid);
-    heldSids.delete(sid);
-    if (heldLocks.has(sid)) releaseLock(sid);
+  const beforeOrder = model.blocks.map((b) => b.id).join(",");
+  const beforeSigs = new Map(model.blocks.map((b) => [b.id, sigOf(b)]));
+  const oldSourceById = new Map(model.blocks.map((b) => [b.id, b.source]));
+  const dirty = mergeBlocks(model, payload, lang);
+  // Keep the pre-edit source text in memory for sentence-level diffing; it is
+  // not persisted (a dead client just costs one whole-block retranslation).
+  for (const id of dirty) {
+    const b = model.blocks.find((x) => x.id === id);
+    if (b?.prev_html && !prevHtmlById.has(id)) prevHtmlById.set(id, b.prev_html);
+    const info = diffSentenceIndices(prevHtmlById.get(id), b?.content[b.source]);
+    if (info) sentenceState.set(id, info);
+    else sentenceState.delete(id); // no history: whole-block highlight
   }
-
-  for (const b of blocks) {
-    lastReceived.set(b.id, {
-      html: b.html, sig: sigOf(b),
-      sents: byPid.get(b.id).sents.map((s) => ({ sid: s.sid, html: s.html })),
-    });
+  // Type/attr changes (heading toggle, list indent) and reorders show in every
+  // language tab, so they force a full rewrite of all of them; plain text
+  // edits only rewrite the changed blocks in our own tab. Staleness reaches
+  // the other tabs through the source tab's new ownHash — no meta write, no
+  // other-tab writes needed for a plain edit.
+  const structureChanged =
+    model.blocks.map((b) => b.id).join(",") !== beforeOrder ||
+    model.blocks.some((b) => beforeSigs.has(b.id) && beforeSigs.get(b.id) !== sigOf(b));
+  const plans = {};
+  if (structureChanged) {
+    for (const l of model.languages) plans[l.code] = "full";
+  } else {
+    plans[lang] = new Set(dirty);
+    // When a block's source language changes (edited in a language that
+    // wasn't the source), revoke the old source tab's own==src claim in the
+    // SAME atomic write — otherwise other clients briefly see two tabs
+    // claiming source and can mark the fresh edit as stale.
+    for (const id of dirty) {
+      const old = oldSourceById.get(id);
+      if (old && old !== lang) (plans[old] = plans[old] || new Set()).add(id);
+    }
   }
-  const ids = new Set(blocks.map((b) => b.id));
-  for (const id of [...lastReceived.keys()]) if (!ids.has(id)) lastReceived.delete(id);
-
-  // Take sentence locks NOW so other clients highlight the right sentences
-  // before the content pull marks them pending.
-  if (dirtySids.length) {
+  // Take the locks NOW (not when translation starts 1s later) so other
+  // clients get the sentence-level info before the content pull marks the
+  // block pending — otherwise they flash a whole-paragraph highlight first.
+  if (dirty.length && canEdit) {
     const lockProps = {};
-    for (const sid of dirtySids) {
-      lockProps[lockKey(sid)] = `${clientId}:${Date.now()}`;
-      heldLocks.add(sid);
+    for (const id of dirty) {
+      lockProps[lockKey(id)] = `${clientId}:${Date.now()}${encodeLockSpec(sentenceState.get(id))}`;
+      heldLocks.add(id);
     }
     G.setAppProperties(docId, lockProps).catch(() => {});
   }
-  // Hold + arm the translation BEFORE painting, so the sentence shows green
-  // (held) from the very first edit — it fires ~1s after typing pauses
-  // (every further send resets the timer).
-  for (const sid of dirtySids) {
-    heldSids.add(sid);
-    scheduleTranslate(sid, 800);
-  }
-  applyLocalModel();
-  queueWrite(plan, false, intents);
-}
-
-function applyIntents(m, intents) {
-  // Fold local edit intents into a model (fresh from a pull, or re-derived
-  // after a write conflict). Returns the dirty sids and the write plan.
-  const editLang = intents.lang;
-  const others = m.languages.map((l) => l.code).filter((c) => c !== editLang);
-  for (const sid of intents.removed) m.sents.delete(sid);
-  m.paras = intents.newParas.map((p) => ({
-    pid: p.pid, type: p.type, attrs: p.attrs, sids: p.sents.map((s) => s.sid),
-  }));
-  const dirtySids = [];
-  const touched = new Set();
-  for (const p of intents.newParas) {
-    for (const s of p.sents) {
-      if (!s.changed && !s.sepOnly) continue;
-      touched.add(p.pid);
-      let sent = m.sents.get(s.sid);
-      if (!sent) {
-        sent = { source: editLang, content: {}, pending: [] };
-        m.sents.set(s.sid, sent);
-      }
-      sent.content[editLang] = s.html;
-      if (!s.changed) continue; // trailing-whitespace only: write, don't retranslate
-      sent.source = editLang;
-      if (isShared(p.type, s.html)) {
-        for (const o of others) sent.content[o] = s.html;
-        sent.pending = [];
-      } else {
-        sent.pending = [...others];
-        dirtySids.push(s.sid);
-      }
+  // Hold + arm the translation BEFORE painting, so the changed sentences show
+  // green (held) from the very first edit; the translation fires ~1s after
+  // typing pauses (each send resets the fuse). Warn once on huge paragraphs —
+  // whole paragraphs are the unit of sync, merge and translation.
+  for (const id of dirty) {
+    heldBlocks.add(id);
+    scheduleTranslate(id, 800);
+    const b = model.blocks.find((x) => x.id === id);
+    const len = stripTags(b?.content[lang] || "").length;
+    if (len > LONG_BLOCK_CHARS && !warnedLong.has(id)) {
+      warnedLong.add(id);
+      toast("This paragraph is getting long — Babbel syncs, merges and translates whole paragraphs, so consider splitting it.", true);
+    } else if (len < LONG_BLOCK_CHARS / 2) {
+      warnedLong.delete(id);
     }
   }
-  const plan = intents.structural ? { full: true } : { paras: { [editLang]: touched } };
-  return { dirtySids, plan };
+  applyLocalModel();
+  queueWrite(plans, false);
 }
 
 function applyLocalModel() {
-  // Refresh highlights + cost from the local model without touching text.
-  if (!view || !model) return;
-  view.dispatch(view.state.tr.setMeta(pendingKey, decorationInput(renderView(model, lang))));
+  // Refresh pending highlights + cost from the local model without touching text.
+  if (!view) return;
+  const rendered = renderBlocks(model, lang);
+  view.dispatch(view.state.tr.setMeta(pendingKey, decorationInput(rendered)));
   updateTranslating();
   updateCost();
 }
@@ -608,10 +604,7 @@ function applyRemote(blocks) {
   if (!view) return;
   if (hasUnsentChanges()) { skippedRemote = true; return; }
 
-  lastReceived = new Map(blocks.map((b) => [b.id, {
-    html: b.html, sig: sigOf(b),
-    sents: (b.pieces || []).filter((p) => !p.gap).map((p) => ({ sid: p.sid, html: p.html })),
-  }]));
+  lastReceived = new Map(blocks.map((b) => [b.id, { html: b.html, sig: sigOf(b) }]));
   const pending = decorationInput(blocks);
   const newDoc = blocksToDoc(blocks);
 
@@ -782,96 +775,53 @@ async function refreshSnapshot() {
   els.docName.textContent = docName;
 }
 
-// The meta tab stores config + cost only; all text and per-sentence sync
-// state live in the language tabs and their named ranges.
+// The meta tab stores config + cost only; all text and per-block sync state
+// live in the language tabs and their named ranges.
 const metaConfig = () => ({
-  babel: 3,
+  babel: 2,
   model: model.model,
   apiKey: model.apiKey,
   languages: model.languages,
   usage: model.usage,
 });
 
-// --- Model -> view / tab rendering -----------------------------------------------
-
-function renderView(m, code) {
-  // Editor blocks for one language, with per-sentence pieces for decorations.
-  const blocks = [];
-  for (const p of m.paras) {
-    const isCode = p.type === "code";
-    const pieces = [];
-    let html = "";
-    let off = 0;
-    for (const sid of p.sids) {
-      const s = m.sents.get(sid);
-      if (!s) continue;
-      const c = s.content[code];
-      if (c === undefined) {
-        // Not translated yet and never populated: show a blank-space gap.
-        pieces.push({ sid, gap: true, at: off });
-        continue;
-      }
-      const len = plainLen(c, isCode);
-      pieces.push({
-        sid, html: c, start: off, end: off + len,
-        pending: (s.pending || []).includes(code),
-        outgoing: s.source === code && (s.pending || []).length > 0,
-      });
-      html += c;
-      off += len;
-    }
-    blocks.push({ id: p.pid, type: p.type, attrs: p.attrs, html, pieces });
-  }
-  return blocks;
+function rangeNameFor(block, code) {
+  // babel:<id>:<ownHash>:<srcHash> for what we are about to write into `code`.
+  const html = block.content[code] ?? block.content[block.source] ?? Object.values(block.content)[0] ?? "";
+  const own = D.blockHash(block.type, block.attrs, html);
+  let src;
+  if (code === block.source) src = own;
+  else if (block.pending?.includes(code)) src = D.STALE_HASH;
+  else src = D.blockHash(block.type, block.attrs, block.content[block.source] ?? "");
+  return D.rangeName(block.id, own, src);
 }
 
-function renderTabPara(code, p) {
-  // What one paragraph should contain in one language tab, with range names.
-  const isCode = p.type === "code";
-  const pieces = [];
-  for (const sid of p.sids) {
-    const s = model.sents.get(sid);
-    if (!s) continue;
-    const c = s.content[code];
-    if (c === undefined) continue; // untranslated insert: absent from this tab
-    const own = isCode ? D.codeHash(c) : D.sentHash(c);
-    let src;
-    if (s.source === code) src = own;
-    else if ((s.pending || []).includes(code)) src = D.STALE_HASH;
-    else {
-      const sh = s.content[s.source] ?? "";
-      src = isCode ? D.codeHash(sh) : D.sentHash(sh);
-    }
-    pieces.push({ sid, html: c, own, src });
-  }
-  return { pid: p.pid, type: p.type, attrs: p.attrs, pieces };
-}
-
-const renderTabParas = (code) => model.paras.map((p) => renderTabPara(code, p));
-
-// --- Writes -----------------------------------------------------------------------
-
-function buildWriteRequests(plan, metaChanged) {
+function buildWriteRequests(tabPlans, metaChanged) {
+  // tabPlans: {langCode: "full" | Set(blockIds)} — always built against the
+  // current docSnapshot, so indices match the revision we condition on.
   const requests = [];
-  if (plan?.full) {
-    for (const l of model.languages) {
-      const tab = langTab(l.code);
-      if (tab) requests.push(...D.fullTabRewriteRequests(tab, renderTabParas(l.code)));
-    }
-  } else if (plan?.paras) {
-    for (const [code, pids] of Object.entries(plan.paras)) {
-      const tab = langTab(code);
-      if (!tab || !pids.size) continue;
+  const blockById = new Map(model.blocks.map((b) => [b.id, b]));
+  for (const [code, plan] of Object.entries(tabPlans || {})) {
+    const tab = langTab(code);
+    if (!tab) continue;
+    const rendered = renderBlocks(model, code);
+    const nameFor = (rb) => rangeNameFor(blockById.get(rb.id), code);
+    if (plan === "full") {
+      requests.push(...D.fullTabRewriteRequests(tab, rendered, nameFor));
+    } else {
       const parsed = D.parseLanguageTab(tab);
-      const byPid = new Map(parsed.paras.filter((p) => p.pid).map((p) => [p.pid, p]));
-      const wanted = [...pids].filter((pid) => model.paras.some((p) => p.pid === pid));
-      if (wanted.some((pid) => !byPid.has(pid))) {
-        requests.push(...D.fullTabRewriteRequests(tab, renderTabParas(code)));
+      const spans = parsed.spans;
+      const oldNameById = new Map(parsed.blocks.filter((b) => b.id).map((b) => [b.id, b.name]));
+      const targets = rendered
+        .filter((b) => plan.has(b.id) && spans.has(b.id))
+        .sort((a, b) => spans.get(b.id)[0] - spans.get(a.id)[0]); // bottom-up
+      const missing = [...plan].some((id) => !spans.get(id) && rendered.some((b) => b.id === id));
+      if (missing) {
+        requests.push(...D.fullTabRewriteRequests(tab, rendered, nameFor));
       } else {
-        wanted.sort((a, b) => byPid.get(b).span[0] - byPid.get(a).span[0]); // bottom-up
-        for (const pid of wanted) {
-          const p = model.paras.find((x) => x.pid === pid);
-          requests.push(...D.paraRewriteRequests(tab, byPid.get(pid), renderTabPara(code, p)));
+        for (const b of targets) {
+          requests.push(...D.singleBlockRewriteRequests(
+            tab, b, spans.get(b.id), nameFor(b), [oldNameById.get(b.id)].filter(Boolean)));
         }
       }
     }
@@ -883,42 +833,86 @@ function buildWriteRequests(plan, metaChanged) {
   return requests;
 }
 
-function queueWrite(plan, metaChanged, intents) {
-  // Serialized writes conditioned on the snapshot's revisionId. On conflict
-  // (another client wrote first) the model is RE-DERIVED from the fresh doc
-  // and our unwritten local edits are re-applied on top — this is what makes
-  // two people editing different sentences of the same paragraph merge
-  // instead of clobbering each other.
+async function resolveConflicts(tabPlans) {
+  // Two people edited the same paragraph at the same time (in the same
+  // language): the tab already holds THEIR version while we are about to
+  // write OURS. Instead of last-write-wins, have Claude merge the two
+  // versions against the base we both started from. Merged paragraphs get a
+  // purple highlight and are retranslated.
+  if (!model?.apiKey) return;
+  for (const [code, plan] of Object.entries(tabPlans || {})) {
+    if (plan === "full" || !plan?.size) continue;
+    const tab = langTab(code);
+    if (!tab) continue;
+    const parsed = D.parseLanguageTab(tab);
+    const tabHtml = new Map(parsed.blocks.filter((b) => b.id).map((b) => [b.id, b.html]));
+    for (const id of plan) {
+      const base = editBase.get(id);
+      const block = model.blocks.find((b) => b.id === id);
+      const theirs = tabHtml.get(id);
+      const ours = block?.content[code];
+      if (base === undefined || !block || theirs === undefined || ours === undefined) continue;
+      if (theirs === base || theirs === ours || !stripTags(theirs).trim()) continue;
+      // Genuine concurrent edit. Merge with Claude (Sonnet).
+      mergedBlocks.add(id);
+      applyLocalModel();
+      const spent = { input: 0, output: 0, calls: 0 };
+      const cfg = { apiKey: model.apiKey, model: model.model || T.DEFAULT_MODEL };
+      try {
+        const merged = await T.mergeParagraphs(cfg, base, ours, theirs, langName(code), spent);
+        model.usage.input_tokens += spent.input;
+        model.usage.output_tokens += spent.output;
+        model.usage.calls += spent.calls;
+        model.usage.cost_usd += T.costOf(cfg.model, spent.input, spent.output);
+        block.content[code] = sanitizeInlineHtml(merged);
+        block.source = code;
+        block.prev_html = base;
+        block.pending = model.languages.map((l) => l.code).filter((c) => c !== code);
+        if (lang === code) {
+          // Reflect the merge in the editor (applyRemote respects unsent edits).
+          lastReceived.delete(id);
+          applyRemote(renderBlocks(model, lang));
+        }
+        scheduleTranslate(id, 400);
+        toast("Merged simultaneous edits to a paragraph");
+      } catch (err) {
+        console.error(err);
+        toast(`Couldn't merge simultaneous edits: ${err.message}`, true);
+      }
+      setTimeout(() => { mergedBlocks.delete(id); applyLocalModel(); }, 5000);
+    }
+  }
+}
+
+function queueWrite(tabPlans, metaChanged) {
+  // Writes are serialized, conditioned on the snapshot's revisionId, and
+  // rebuilt from a fresh snapshot when another client wrote in between.
   queuedWrites += 1;
   writeChain = writeChain.then(async () => {
-    if (!model) { return; }
+    if (!model) return;
     writing = true;
     setSync("busy", "Saving…");
     try {
-      let curPlan = plan;
       for (let attempt = 0; ; attempt++) {
         try {
-          const requests = buildWriteRequests(curPlan, metaChanged);
+          await resolveConflicts(tabPlans);
+          const requests = buildWriteRequests(tabPlans, metaChanged);
           if (requests.length) {
             await G.batchUpdate(docId, requests, docSnapshot.revisionId);
             await refreshSnapshot();
           }
           break;
         } catch (err) {
-          if (attempt >= 4) throw err;
-          await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
-          await refreshSnapshot();
-          const metaTab = D.findMetaTab(docSnapshot);
-          const cfg = metaTab ? D.parseMeta(metaTab) : null;
-          if (cfg && cfg.babel === 3) {
-            model = buildModel(docSnapshot, cfg).model;
-            if (intents && currentIntents === intents) {
-              curPlan = applyIntents(model, intents).plan;
-            }
-          }
+          if (err.authExpired || attempt >= 4) throw err;
+          await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+          await refreshSnapshot(); // doc moved under us — rebuild and retry
         }
       }
-      if (intents && currentIntents === intents) currentIntents = null;
+      // Our edits are canonical now; future edits get a fresh conflict base.
+      for (const [, plan] of Object.entries(tabPlans || {})) {
+        if (plan instanceof Set) for (const id of plan) editBase.delete(id);
+        else if (plan === "full") editBase.clear();
+      }
       setSync("on", "Synced");
     } catch (err) {
       console.error(err);
@@ -930,6 +924,7 @@ function queueWrite(plan, metaChanged, intents) {
         setSync("off", "Save failed");
         toast(`Save failed: ${err.message}`, true);
       }
+      // Re-pull on next poll so we converge with whatever is in the doc.
       lastVersion = null;
       lastRevision = null;
     } finally {
@@ -940,102 +935,63 @@ function queueWrite(plan, metaChanged, intents) {
   return writeChain;
 }
 
-// --- Model derivation from the doc ---------------------------------------------------
-
-function buildModel(doc, cfg) {
-  // Rebuild the two-tier model purely from the language tabs + range names.
+function deriveModel(doc, meta) {
+  // Rebuild the block model purely from the language tabs + range names.
+  // Text lives only in the tabs; ownHash/srcHash in the range names tell us
+  // consistency (edited outside the app?) and staleness (needs translating?).
   const perLang = [];
-  for (const l of cfg.languages) {
+  for (const l of meta.languages) {
     const tab = D.tabById(doc, l.tabId);
     if (tab) perLang.push({ code: l.code, ...D.parseLanguageTab(tab) });
   }
-  const m = { ...cfg, paras: [], sents: new Map() };
-  m.usage = m.usage || { input_tokens: 0, output_tokens: 0, calls: 0, cost_usd: 0 };
-  if (!perLang.length) return { model: m, repairs: false };
-  const base = perLang.find((pl) => pl.dirty) || perLang[0];
+  if (!perLang.length) return { blocks: [], repairs: false };
 
-  // Reconcile externally edited paragraphs: re-split the text heuristically
-  // (this IS the edited language) and re-match sentence ids by diff — kept
-  // sentences keep ids and translations, edited ones reuse the replaced id.
-  for (const pl of perLang) {
-    if (!pl.dirty) continue;
-    for (const para of pl.paras) {
-      if (!para.broken) continue;
-      if (!para.pid) para.pid = newId();
-      const isCode = para.type === "code";
-      const parts = isCode ? [para.rawHtml] : splitSentencesHtml(para.rawHtml);
-      const olds = para.sents.map((s) => ({
-        sid: s.sid,
-        html: s.own === s.hash ? s.html : `\u0000${s.sid}`, // damaged: never matches
-      }));
-      para.reconciled = computeSentenceMerge(olds, parts.map((h) => ({ pid: para.pid, html: h }))).sents;
+  const dirtyOf = (pl) => pl.blocks.some((b) => !b.id || b.own !== b.hash);
+  // An externally edited tab has the newest text: it defines the order and,
+  // per block, becomes the new source language.
+  const base = perLang.find(dirtyOf) || perLang[0];
+  for (const b of base.blocks) if (!b.id) b.id = newId();
+
+  const byLang = new Map(perLang.map((pl) =>
+    [pl.code, new Map(pl.blocks.filter((b) => b.id).map((b) => [b.id, b]))]));
+
+  const blocks = [];
+  for (const bb of base.blocks) {
+    const entries = new Map();
+    for (const pl of perLang) {
+      const e = pl === base ? bb : byLang.get(pl.code).get(bb.id);
+      if (e) entries.set(pl.code, e);
     }
-  }
-
-  // Collect per-paragraph entries across languages.
-  const paraDefs = new Map();
-  for (const pl of perLang) {
-    for (const para of pl.paras) {
-      if (!para.pid) continue;
-      let def = paraDefs.get(para.pid);
-      if (!def) {
-        def = { pid: para.pid, type: para.type, attrs: para.attrs, seqs: [], entries: new Map() };
-        paraDefs.set(para.pid, def);
-      }
-      if (pl === base) { def.type = para.type; def.attrs = para.attrs; }
-      const list = para.reconciled
-        ? para.reconciled.map((s) => ({ sid: s.sid, html: s.html, edited: s.changed }))
-        : para.sents.map((s) => ({ sid: s.sid, html: s.html, own: s.own, src: s.src, hash: s.hash }));
-      def.seqs.push({ isBase: pl === base, seq: list.map((s) => s.sid) });
-      for (const s of list) {
-        if (!def.entries.has(s.sid)) def.entries.set(s.sid, new Map());
-        def.entries.get(s.sid).set(pl.code, s);
+    let source = null;
+    for (const [code, e] of entries) if (!e.own || e.own !== e.hash) { source = code; break; } // edited wins
+    if (!source) {
+      // Among tabs claiming source (own==src), prefer the one the other
+      // tabs' srcHashes actually point at — resolves transient dual claims.
+      let bestScore = -1;
+      for (const [code, e] of entries) {
+        if (!e.own || e.own !== e.src) continue;
+        let score = 0;
+        for (const [c2, e2] of entries) if (c2 !== code && e2.src === e.hash) score++;
+        if (score > bestScore) { bestScore = score; source = code; }
       }
     }
+    if (!source) source = base.code;
+    const srcEntry = entries.get(source) || bb;
+    const shared = srcEntry.type === "code" || !stripTags(srcEntry.html).trim();
+    const content = {}, pending = [];
+    for (const l of meta.languages) {
+      const e = entries.get(l.code);
+      if (e) content[l.code] = e.html;
+      if (l.code === source || shared) continue;
+      if (!e || e.src !== srcEntry.hash) pending.push(l.code);
+    }
+    blocks.push({ id: bb.id, type: srcEntry.type, attrs: srcEntry.attrs, content, source, pending });
   }
 
-  for (const bp of base.paras) {
-    if (!bp.pid || m.paras.some((p) => p.pid === bp.pid)) continue;
-    const def = paraDefs.get(bp.pid);
-    if (!def) continue;
-    const seqs = [...def.seqs].sort((a, b) => (b.isBase ? 1 : 0) - (a.isBase ? 1 : 0)).map((x) => x.seq);
-    const sids = mergeSidSequences(seqs);
-    const isCode = def.type === "code";
-    for (const sid of sids) {
-      if (m.sents.has(sid)) continue;
-      const entries = def.entries.get(sid) || new Map();
-      let source = null;
-      for (const [code, e] of entries) if (e.edited) { source = code; break; }
-      if (!source) {
-        // Among tabs claiming source (own==src), prefer the one the other
-        // tabs' srcHashes actually point at (resolves transient dual claims).
-        let bestScore = -1;
-        for (const [code, e] of entries) {
-          if (!e.own || e.own !== e.src) continue;
-          let score = 0;
-          for (const [c2, e2] of entries) if (c2 !== code && e2.src === e.hash) score++;
-          if (score > bestScore) { bestScore = score; source = code; }
-        }
-      }
-      if (!source) source = entries.keys().next().value;
-      if (!source) continue;
-      const srcE = entries.get(source);
-      const shared = isCode || !stripTags(srcE.html || "").trim();
-      const srcHash = srcE.hash ?? (isCode ? D.codeHash(srcE.html) : D.sentHash(srcE.html));
-      const content = {};
-      const pending = [];
-      for (const l of cfg.languages) {
-        const e = entries.get(l.code);
-        if (e) content[l.code] = e.html;
-        if (l.code === source) continue;
-        if (shared) { if (!e) content[l.code] = srcE.html; continue; }
-        if (!e || e.edited || srcE.edited || e.src !== srcHash) pending.push(l.code);
-      }
-      m.sents.set(sid, { source, content, pending });
-    }
-    m.paras.push({ pid: bp.pid, type: def.type, attrs: def.attrs, sids });
-  }
-  return { model: m, repairs: perLang.some((pl) => pl.dirty) };
+  const baseOrder = base.blocks.map((b) => b.id).join(",");
+  const structural = perLang.some((pl) =>
+    pl !== base && pl.blocks.map((b) => b.id).filter(Boolean).join(",") !== baseOrder);
+  return { blocks, repairs: perLang.some(dirtyOf) || structural };
 }
 
 async function pullDoc() {
@@ -1043,35 +999,39 @@ async function pullDoc() {
   docSnapshot = doc;
   lastRevision = doc.revisionId;
   const metaTab = D.findMetaTab(doc);
-  const cfg = metaTab ? D.parseMeta(metaTab) : null;
-  if (!cfg || cfg.babel !== 3) { enterSetup(doc); return; }
+  const meta = metaTab ? D.parseMeta(metaTab) : null;
+  if (!meta || meta.babel !== 2) { enterSetup(doc); return; }
 
-  const built = buildModel(doc, cfg);
-  model = built.model;
-  const repairs = built.repairs;
-  // Keep unwritten local edits on top of the fresh state.
-  if (currentIntents) applyIntents(model, currentIntents);
+  const { blocks, repairs } = deriveModel(doc, meta);
+  model = { ...meta, blocks };
+  model.usage = model.usage || { input_tokens: 0, output_tokens: 0, calls: 0, cost_usd: 0 };
 
   if (!model.languages.some((l) => l.code === lang)) {
     lang = model.languages[0]?.code;
   }
+
+  // Repair pass (external edits / structural drift): rewrite all tabs so
+  // every range name matches reality again — but never while our own writes
+  // or edits are still in flight, which would clobber them.
   // Defer repairs while another client is mid-flight (its locks are live) —
   // competing full rewrites are what turn into revision-conflict storms.
-  if (repairs && canEdit && !queuedWrites && !hasUnsentChanges() && !lockedSids.size) {
-    queueWrite({ full: true }, false);
+  if (repairs && canEdit && !queuedWrites && !hasUnsentChanges() && !lockedBlocks.size) {
+    const plans = {};
+    for (const l of model.languages) plans[l.code] = "full";
+    queueWrite(plans, false);
   }
-  // Pick up stale sentences (external edit, dead translator, new language) —
-  // but slowly, and never ones another client is already translating: the
-  // editing client schedules its own work at 1s and should win.
+  // Pick up stale blocks (external edit, dead translator, new language) —
+  // slowly, and never ones another client is already translating: the
+  // editing client schedules its own work at ~1s and should win.
   if (canEdit && model.apiKey && !queuedWrites) {
-    for (const [sid, s] of model.sents) {
-      if (s.pending?.length && !lockedSids.has(sid) && !heldLocks.has(sid)) {
-        scheduleTranslate(sid, 4000);
+    for (const b of model.blocks) {
+      if (b.pending?.length && !lockedBlocks.has(b.id) && !heldLocks.has(b.id)) {
+        scheduleTranslate(b.id, 4000);
       }
     }
   }
 
-  applyRemote(renderView(model, lang));
+  applyRemote(renderBlocks(model, lang));
   updateLangSelect();
   updateCost();
   updateTranslating();
@@ -1084,13 +1044,19 @@ async function pollLoop() {
       const meta = await G.getFileMeta(docId);
       scanLocks(meta.appProperties); // lock highlights ride the 500ms poll
       // Drive version bumps on any change (incl. lock patches); revisionId
-      // only on content changes — pull the doc just for the latter.
+      // only on content changes — pull the doc just for the latter. While
+      // there's recent activity (locks live, edits in flight) probe the
+      // revision every tick so translations land fast; idle docs probe 4x
+      // slower to stay inside the Docs read quota.
+      const active = lockedBlocks.size || heldLocks.size ||
+        Date.now() - lastActivityAt < 15000;
       if (meta.version !== lastVersion) {
+        lastActivityAt = Date.now();
         docName = meta.name;
         els.docName.textContent = docName;
         if ((await G.getRevisionId(docId)) !== lastRevision) await pullDoc();
         lastVersion = meta.version; // commit only after a successful pull
-      } else if (pollTick % 2 === 1) {
+      } else if (active || pollTick % 4 === 3) {
         // Backstop: Drive's version field can lag content changes.
         if ((await G.getRevisionId(docId)) !== lastRevision) await pullDoc();
       }
@@ -1129,38 +1095,54 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && docId && model) pollLoop();
 });
 
-// --- Locks (invisible Drive appProperties, one per sentence) ----------------------------
+
+// --- Locks (invisible Drive appProperties) ----------------------------------------------
 
 const LOCK_TTL_MS = 2 * 60 * 1000;
-const lockKey = (sid) => `lock_${sid}`;
+const lockKey = (blockId) => `lock_${blockId}`;
 
 function parseLockVal(v) {
   if (!v) return null;
-  const [c, t] = String(v).split(":");
-  return { c, t: Number(t) || 0 };
+  const [c, t, spec] = String(v).split(":");
+  const out = { c, t: Number(t) || 0, st: null };
+  // spec: "n1,3;d1;i2" — sentence indices (see diffSentenceIndices).
+  const m = spec && spec.match(/^n([\d,]*);d([\d,]*);i([\d,]*)$/);
+  if (m) {
+    const nums = (s) => s ? s.split(",").map(Number) : [];
+    out.st = { n: nums(m[1]), d: nums(m[2]), ins: nums(m[3]) };
+  }
+  return out;
 }
 
-async function acquireLock(sid) {
+function encodeLockSpec(st) {
+  if (!st) return "";
+  const spec = `n${st.n.join(",")};d${st.d.join(",")};i${st.ins.join(",")}`;
+  return spec.length <= 80 ? `:${spec}` : ""; // appProperties values cap at ~124 bytes
+}
+
+async function acquireLock(blockId) {
   // appProperties are per-key, so concurrent clients can't clobber each
-  // other's locks; the write-then-read-back settles same-key races.
-  if (heldLocks.has(sid)) return true; // taken at edit time
-  const key = lockKey(sid);
+  // other's locks; the write-then-read-back settles same-key races. The value
+  // carries the affected sentences so other clients highlight only those.
+  if (heldLocks.has(blockId)) return true; // already taken at edit time
+  const key = lockKey(blockId);
   const pre = parseLockVal((await G.getFileMeta(docId)).appProperties?.[key]);
   if (pre && pre.c !== clientId && Date.now() - pre.t < LOCK_TTL_MS) return false;
-  await G.setAppProperties(docId, { [key]: `${clientId}:${Date.now()}` });
+  const spec = encodeLockSpec(sentenceState.get(blockId));
+  await G.setAppProperties(docId, { [key]: `${clientId}:${Date.now()}${spec}` });
   const post = parseLockVal((await G.getFileMeta(docId)).appProperties?.[key]);
   if (post?.c !== clientId) return false;
-  heldLocks.add(sid);
+  heldLocks.add(blockId);
   return true;
 }
 
-async function releaseLock(sid) {
-  heldLocks.delete(sid);
-  await G.setAppProperties(docId, { [lockKey(sid)]: null }).catch(() => {});
+async function releaseLock(blockId) {
+  heldLocks.delete(blockId);
+  await G.setAppProperties(docId, { [lockKey(blockId)]: null }).catch(() => {});
 }
 
 function scanLocks(appProperties) {
-  // Runs on every poll: refresh the "being translated elsewhere" highlights
+  // Runs on every poll: refresh the "being translated elsewhere" highlight set
   // and garbage-collect expired locks left by dead clients.
   const fresh = new Set();
   const staleKeys = {};
@@ -1169,60 +1151,56 @@ function scanLocks(appProperties) {
     if (!k.startsWith("lock_")) continue;
     const l = parseLockVal(v);
     if (l && now - l.t < LOCK_TTL_MS) {
-      if (l.c !== clientId) fresh.add(k.slice(5));
+      if (l.c !== clientId) {
+        const blockId = k.slice(5);
+        fresh.add(blockId);
+        // Adopt the locker's sentence info (our own edits take precedence).
+        if (l.st && !prevHtmlById.has(blockId)) sentenceState.set(blockId, l.st);
+      }
     } else if (canEdit) {
       staleKeys[k] = null;
     }
   }
   if (Object.keys(staleKeys).length) G.setAppProperties(docId, staleKeys).catch(() => {});
-  const changed = fresh.size !== lockedSids.size || [...fresh].some((b) => !lockedSids.has(b));
-  lockedSids = fresh;
+  const changed = fresh.size !== lockedBlocks.size || [...fresh].some((b) => !lockedBlocks.has(b));
+  lockedBlocks = fresh;
+  if (changed) lastActivityAt = Date.now();
   if (changed && model) applyLocalModel();
 }
 
-// --- Translation (per sentence) --------------------------------------------------------
+// --- Translation ------------------------------------------------------------------------
 
-function scheduleTranslate(sid, delay = 1000) {
+function scheduleTranslate(blockId, delay = 1000) {
   if (!canEdit) return;
   if (!model?.apiKey) { toast("No Anthropic API key in babel:meta — translations are paused", true); return; }
-  clearTimeout(translateTimers.get(sid));
-  translateTimers.set(sid, setTimeout(() => {
-    translateTimers.delete(sid);
-    heldSids.delete(sid);
+  clearTimeout(translateTimers.get(blockId));
+  translateTimers.set(blockId, setTimeout(() => {
+    translateTimers.delete(blockId);
+    heldBlocks.delete(blockId);
     applyLocalModel(); // green (held while writing) -> blue (translating)
-    translateSid(sid).catch((err) => {
+    translateBlock(blockId).catch((err) => {
       console.error(err);
       toast(`Translation failed: ${err.message}`, true);
     });
   }, delay));
 }
 
-function paraContext(pid, srcLang) {
-  const idx = model.paras.findIndex((p) => p.pid === pid);
-  const text = (p) => stripTags(p.sids.map((sid) => model.sents.get(sid)?.content[srcLang] || "").join(""));
-  const before = model.paras.slice(Math.max(0, idx - 2), idx).map(text).filter(Boolean).join(" ");
-  const after = model.paras.slice(idx + 1, idx + 3).map(text).filter(Boolean).join(" ");
-  return { before, after, para: text(model.paras[idx]) };
-}
-
-async function translateSid(sid) {
-  const s = model?.sents.get(sid);
-  if (!s || !s.pending?.length) return;
-  if (!(await acquireLock(sid))) return; // another client is on it
+async function translateBlock(blockId) {
+  const block = model?.blocks.find((b) => b.id === blockId);
+  if (!block || !block.pending?.length) return;
+  if (!(await acquireLock(blockId))) return; // another client is on it
   try {
-    const source = s.source;
-    const srcHtml = s.content[source];
-    const para = model.paras.find((p) => p.sids.includes(sid));
-    if (!para || srcHtml === undefined) return;
-    const targets = [...s.pending];
-    const ctx = paraContext(para.pid, source);
+    const source = block.source;
+    const sourceHtml = block.content[source];
+    const targets = [...block.pending];
+    const context = blockContext(model, blockId, source);
     const spent = { input: 0, output: 0, calls: 0 };
     const cfg = { apiKey: model.apiKey, model: model.model || T.DEFAULT_MODEL };
-    const tgtPara = (t) => stripTags(para.sids.map((x) => model.sents.get(x)?.content[t] || "").join(""));
+    const prevHtml = prevHtmlById.get(blockId) ?? block.prev_html;
 
     const results = await Promise.allSettled(targets.map((t) =>
-      T.translateSentenceTo(cfg, srcHtml, ctx.para, tgtPara(t),
-        langName(source), langName(t), ctx, spent)));
+      T.translateBlockTo(cfg, sourceHtml, prevHtml, block.content[t],
+        langName(source), langName(t), context, spent)));
 
     // Record cost even if the result ends up discarded below.
     model.usage.input_tokens += spent.input;
@@ -1230,40 +1208,36 @@ async function translateSid(sid) {
     model.usage.calls += spent.calls;
     model.usage.cost_usd += T.costOf(cfg.model, spent.input, spent.output);
 
-    // Re-check: the sentence may have been re-edited meanwhile.
-    const cur = model.sents.get(sid);
-    if (!cur || cur.source !== source || cur.content[source] !== srcHtml) {
-      queueWrite(null, true);
+    // Re-check: the block may have been re-edited meanwhile.
+    const cur = model.blocks.find((b) => b.id === blockId);
+    if (!cur || cur.content[cur.source] !== sourceHtml) {
+      queueWrite({}, true);
       updateCost();
       return;
     }
-    // The model returns a bare sentence; re-attach the source sentence's
-    // trailing whitespace so sentences don't glue together in the target
-    // paragraph. If the source has none (CJK) but the target ends in ASCII
-    // punctuation and isn't last in its paragraph, add a space.
-    const srcTrailing = (srcHtml.match(/\s*$/) || [""])[0];
-    const isLast = para.sids[para.sids.length - 1] === sid;
     const errors = [];
-    const plans = {};
+    const changedTabs = {};
     targets.forEach((t, i) => {
       const r = results[i];
       if (r.status === "rejected") {
         errors.push(`${langName(t)}: ${r.reason?.message || r.reason}`);
       } else {
-        const clean = sanitizeInlineHtml(r.value).replace(/\s+$/, "");
-        let sep = srcTrailing;
-        if (!sep && !isLast && /[.!?"')\]]$/.test(stripTags(clean))) sep = " ";
-        cur.content[t] = clean + sep;
+        cur.content[t] = sanitizeInlineHtml(r.value);
         cur.pending = (cur.pending || []).filter((p) => p !== t);
-        (plans[t] = plans[t] || new Set()).add(para.pid);
+        changedTabs[t] = new Set([blockId]);
       }
     });
-    queueWrite({ paras: plans }, true); // meta carries the updated usage/cost
-    applyRemote(renderView(model, lang));
+    if (!cur.pending?.length) {
+      delete cur.prev_html;
+      prevHtmlById.delete(blockId);
+      sentenceState.delete(blockId);
+    }
+    queueWrite(changedTabs, true); // meta carries the updated usage/cost
+    if (lang !== cur.source) applyRemote(renderBlocks(model, lang));
     applyLocalModel();
     if (errors.length) toast(`Some translations failed and will retry on the next edit (${errors[0]})`, true);
   } finally {
-    await releaseLock(sid);
+    await releaseLock(blockId);
   }
 }
 
@@ -1288,7 +1262,7 @@ els.langSelect.onchange = () => {
   url.searchParams.set("lang", lang);
   history.replaceState(null, "", url);
   lastReceived = new Map();
-  applyRemote(renderView(model, lang));
+  applyRemote(renderBlocks(model, lang));
 };
 
 els.addLang.onclick = () => {
@@ -1321,24 +1295,20 @@ async function addLanguage() {
       const tabId = await G.addTab(docId, name);
       await refreshSnapshot();
       model.languages.push({ code, name, tabId });
-      for (const p of model.paras) {
-        for (const sid of p.sids) {
-          const s = model.sents.get(sid);
-          if (!s) continue;
-          const srcHtml = s.content[s.source] ?? "";
-          if (isShared(p.type, srcHtml)) {
-            s.content[code] = srcHtml;
-          } else if (s.content[code] === undefined) {
-            s.content[code] = srcHtml; // source-text placeholder until translated
-            s.pending = s.pending || [];
-            if (!s.pending.includes(code)) s.pending.push(code);
-            dirty.push(sid);
-          }
+      for (const b of model.blocks) {
+        if (b.type === "code" || !stripTags(b.content[b.source] || "").trim()) {
+          b.content[code] = b.content[b.source] || "";
+        } else if (!(code in b.content)) {
+          b.pending = b.pending || [];
+          if (!b.pending.includes(code)) b.pending.push(code);
+          dirty.push(b.id);
         }
       }
       const tab = D.tabById(docSnapshot, tabId);
+      const blockById = new Map(model.blocks.map((b) => [b.id, b]));
       const requests = [
-        ...D.fullTabRewriteRequests(tab, renderTabParas(code)),
+        ...D.fullTabRewriteRequests(tab, renderBlocks(model, code),
+          (rb) => rangeNameFor(blockById.get(rb.id), code)),
         ...D.metaRewriteRequests(D.findMetaTab(docSnapshot), metaConfig()),
       ];
       await G.batchUpdate(docId, requests, docSnapshot.revisionId);
@@ -1390,29 +1360,23 @@ els.setupGo.onclick = async () => {
     const doc = await G.getDocument(docId);
     const firstTab = D.flattenTabs(doc)[0];
     const parsed = D.parseLanguageTab(firstTab);
+    const blocks = parsed.blocks.map((b) => ({
+      id: b.id || newId(),
+      type: b.type,
+      attrs: b.attrs,
+      content: { [code]: sanitizeInlineHtml(b.html) },
+      source: code,
+      pending: [],
+    }));
     model = {
-      babel: 3,
+      babel: 2,
       model: T.DEFAULT_MODEL,
       apiKey,
       languages: [{ code, name, tabId: firstTab.tabProperties.tabId }],
       usage: { input_tokens: 0, output_tokens: 0, calls: 0, cost_usd: 0 },
-      paras: [],
-      sents: new Map(),
+      blocks,
     };
-    for (const para of parsed.paras) {
-      const pid = newId();
-      const isCode = para.type === "code";
-      const clean = isCode ? para.rawHtml : sanitizeInlineHtml(para.rawHtml);
-      const parts = isCode ? [clean] : splitSentencesHtml(clean);
-      const sids = [];
-      for (const h of parts) {
-        const sid = newId();
-        sids.push(sid);
-        model.sents.set(sid, { source: code, content: { [code]: h }, pending: [] });
-      }
-      model.paras.push({ pid, type: para.type, attrs: para.attrs, sids });
-    }
-    // Reuse an existing babel:meta tab (e.g. re-setup of an older-format doc).
+    // Reuse an existing babel:meta tab (e.g. re-setup of a v1 document).
     const existingMeta = D.findMetaTab(doc);
     const metaTabId = existingMeta
       ? existingMeta.tabProperties.tabId
@@ -1423,7 +1387,8 @@ els.setupGo.onclick = async () => {
     await G.batchUpdate(docId, [
       { updateDocumentTabProperties: {
         tabProperties: { tabId: firstTab.tabProperties.tabId, title: name }, fields: "title" } },
-      ...D.fullTabRewriteRequests(langTabFresh, renderTabParas(code)),
+      ...D.fullTabRewriteRequests(langTabFresh, renderBlocks(model, code),
+        (rb) => rangeNameFor(model.blocks.find((b) => b.id === rb.id), code)),
       ...D.metaRewriteRequests(metaTabFresh, metaConfig()),
     ]);
     lang = code;
@@ -1493,7 +1458,7 @@ async function enterEditor() {
   if (model) {
     if (!lang || !model.languages.some((l) => l.code === lang)) lang = model.languages[0]?.code;
     updateLangSelect();
-    applyRemote(renderView(model, lang));
+    applyRemote(renderBlocks(model, lang));
     pollLoop();
   }
 }
@@ -1544,14 +1509,17 @@ els.signIn.onclick = async () => {
 els.openOther.onclick = () => {
   // Leave the current document and go back to the landing page.
   clearTimeout(pollTimer);
-  lockedSids = new Set();
-  heldLocks.clear();
-  currentIntents = null;
+  lockedBlocks = new Set();
   clearTimeout(sendTimer);
   sendTimer = null;
   for (const t of translateTimers.values()) clearTimeout(t);
   translateTimers.clear();
-  heldSids.clear();
+  heldBlocks.clear();
+  editBase.clear();
+  mergedBlocks.clear();
+  warnedLong.clear();
+  sentenceState.clear();
+  prevHtmlById.clear();
   model = null; docId = null; docSnapshot = null;
   lastVersion = null; lastRevision = null;
   lastReceived = new Map();

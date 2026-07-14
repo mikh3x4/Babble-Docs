@@ -99,6 +99,28 @@ export function translateSentenceTo(cfg, sentenceHtml, paraSrcPlain, tgtParaPlai
     sourceName, targetName, context, spent);
 }
 
+export async function mergeParagraphs(cfg, base, ours, theirs, languageName, spent) {
+  // Two people edited the same paragraph simultaneously: three-way merge.
+  const prompt = `Two collaborators edited the same paragraph of a document at the same time,
+starting from the same original. Merge BOTH sets of changes into one coherent
+paragraph in ${languageName}. Keep every change that doesn't conflict; where
+the same words were changed differently, prefer the phrasing that reads best
+while keeping both collaborators' meaning. The text is inline HTML — preserve
+formatting tags (<strong>, <em>, <u>, <s>, <code>, <a>, <br>).
+
+ORIGINAL PARAGRAPH:
+${base}
+
+COLLABORATOR A's VERSION:
+${ours}
+
+COLLABORATOR B's VERSION:
+${theirs}
+
+Reply with ONLY the merged paragraph as inline HTML — no quotes, no explanation.`;
+  return callClaude(cfg.apiKey, cfg.model || DEFAULT_MODEL, prompt, spent);
+}
+
 export async function verifyApiKey(apiKey) {
   // One tiny request to confirm the key works before storing it in the doc.
   const spent = { input: 0, output: 0, calls: 0 };

@@ -17,13 +17,14 @@ the browser with the signed-in user's own OAuth token.
 - **The Google Doc is the storage — with no duplicated content.** One tab per
   language holds the rendered, human-readable document; a small `babel:meta`
   tab holds only config (languages, the Anthropic API key, cost counters).
-- **Sentences are the unit of sync.** Paragraphs carry structure (headings,
-  bullets, nesting) via `babelp:` named ranges; every sentence has its own
-  invisible `babel:<id>:<ownHash>:<srcHash>` range. Hash mismatches detect
-  outside edits (reconciled and retranslated); a translation whose `srcHash`
-  no longer matches its source sentence is stale. Two people editing
-  different sentences of the same paragraph — same language or different
-  languages — merge cleanly; only same-sentence conflicts are last-write-wins.
+- **Paragraphs are the unit of sync**, tracked by invisible named ranges
+  (`babel:<id>:<ownHash>:<srcHash>`). Hash mismatches detect outside edits
+  (reconciled and retranslated); a translation whose `srcHash` no longer
+  matches its source paragraph is stale. Within a paragraph, only the
+  sentences you actually changed are retranslated and highlighted. If two
+  people edit the same paragraph at the same time, Claude merges the two
+  versions (purple flash) instead of one overwriting the other. Keep
+  paragraphs reasonably short — the app warns when one gets very long.
 - **Sentence-level translation**: only the sentences you actually edited are
   retranslated (Claude Sonnet, called straight from the browser) — the
   surrounding paragraph and neighboring blocks ride along as context.
