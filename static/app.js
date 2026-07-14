@@ -355,6 +355,7 @@ let lockedSids = new Set();    // sentence ids other clients are translating
 let currentIntents = null;     // latest unwritten local edits (re-applied on write conflicts)
 const clientId = newId();
 const translateTimers = new Map(); // sid -> timeout
+const heldSids = new Set();        // sids edited locally, translation held until typing pauses (green)
 const heldLocks = new Set();       // sids we hold appProperties locks for
 
 const sigOf = (b) => `${b.type}|${JSON.stringify(b.attrs || {})}`;
@@ -425,7 +426,7 @@ function decorationInput(blocks) {
       const locked = lockedSids.has(pc.sid);
       const out = pc.outgoing || (locked && s?.source === lang);
       const inc = pc.pending || (locked && s?.source !== lang);
-      if (out && translateTimers.has(pc.sid)) sentsEditing.push([pc.start, pc.end]); // waiting for you to finish
+      if (out && heldSids.has(pc.sid)) sentsEditing.push([pc.start, pc.end]); // you're writing: held
       else if (out) sentsOut.push([pc.start, pc.end]);
       else if (inc) sentsIn.push([pc.start, pc.end]);
     }
@@ -525,10 +526,9 @@ function sendUpdate() {
     // everyone's "Translating…" badge) until the TTL.
     clearTimeout(translateTimers.get(sid));
     translateTimers.delete(sid);
-    lastEditAt.delete(sid);
+    heldSids.delete(sid);
     if (heldLocks.has(sid)) releaseLock(sid);
   }
-  for (const sid of dirtySids) lastEditAt.set(sid, Date.now());
 
   for (const b of blocks) {
     lastReceived.set(b.id, {
@@ -549,9 +549,15 @@ function sendUpdate() {
     }
     G.setAppProperties(docId, lockProps).catch(() => {});
   }
+  // Hold + arm the translation BEFORE painting, so the sentence shows green
+  // (held) from the very first edit — it fires ~1s after typing pauses
+  // (every further send resets the timer).
+  for (const sid of dirtySids) {
+    heldSids.add(sid);
+    scheduleTranslate(sid, 800);
+  }
   applyLocalModel();
   queueWrite(plan, false, intents);
-  for (const sid of dirtySids) scheduleTranslate(sid);
 }
 
 function applyIntents(m, intents) {
@@ -1176,41 +1182,19 @@ function scanLocks(appProperties) {
 
 // --- Translation (per sentence) --------------------------------------------------------
 
-const lastEditAt = new Map(); // sid -> last local edit timestamp
-
 function scheduleTranslate(sid, delay = 1000) {
   if (!canEdit) return;
   if (!model?.apiKey) { toast("No Anthropic API key in babel:meta — translations are paused", true); return; }
   clearTimeout(translateTimers.get(sid));
   translateTimers.set(sid, setTimeout(() => {
     translateTimers.delete(sid);
-    applyLocalModel(); // green (waiting) -> blue (translating)
+    heldSids.delete(sid);
+    applyLocalModel(); // green (held while writing) -> blue (translating)
     translateSid(sid).catch((err) => {
       console.error(err);
       toast(`Translation failed: ${err.message}`, true);
     });
   }, delay));
-}
-
-function cursorInSid(sid) {
-  // Is the local cursor inside this sentence (in the current view)?
-  if (!view || !model) return false;
-  const para = model.paras.find((p) => p.sids.includes(sid));
-  if (!para) return false;
-  const b = renderView(model, lang).find((x) => x.id === para.pid);
-  const pc = b?.pieces.find((x) => x.sid === sid && !x.gap);
-  if (!pc) return false;
-  const { head } = view.state.selection;
-  const $head = view.state.doc.resolve(head);
-  for (let d = $head.depth; d > 0; d--) {
-    const node = $head.node(d);
-    if (ID_TYPES.has(node.type.name) && node.attrs.id) {
-      let offset = head - $head.start(d);
-      if (node.type.name === "list_item") offset -= 1; // inner paragraph token
-      return node.attrs.id === para.pid && offset >= pc.start && offset <= pc.end;
-    }
-  }
-  return false;
 }
 
 function paraContext(pid, srcLang) {
@@ -1224,14 +1208,6 @@ function paraContext(pid, srcLang) {
 async function translateSid(sid) {
   const s = model?.sents.get(sid);
   if (!s || !s.pending?.length) return;
-  // Still writing? (cursor inside the sentence, edited <5s ago) — wait, so
-  // one translation fires when the user is done instead of several.
-  if (s.source === lang && cursorInSid(sid) &&
-      Date.now() - (lastEditAt.get(sid) || 0) < 5000) {
-    scheduleTranslate(sid, 1500);
-    applyLocalModel();
-    return;
-  }
   if (!(await acquireLock(sid))) return; // another client is on it
   try {
     const source = s.source;
@@ -1575,6 +1551,7 @@ els.openOther.onclick = () => {
   sendTimer = null;
   for (const t of translateTimers.values()) clearTimeout(t);
   translateTimers.clear();
+  heldSids.clear();
   model = null; docId = null; docSnapshot = null;
   lastVersion = null; lastRevision = null;
   lastReceived = new Map();
