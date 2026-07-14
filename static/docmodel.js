@@ -287,6 +287,13 @@ export function fullTabRewriteRequests(tab, blocks, nameFor) {
   const plans = blocks.map(blockRenderPlan);
   const fullText = plans.map((p) => p.text).join("\n");
   requests.push({ insertText: { location: { index: 1, tabId }, text: fullText } });
+  // The surviving final paragraph keeps its old paragraph properties — if it
+  // was a list item, every inserted paragraph inherits its bullet and the
+  // whole document turns into one list. Strip inherited bullets first;
+  // legitimate list runs are recreated below.
+  requests.push({ deleteParagraphBullets: {
+    range: { startIndex: 1, endIndex: 1 + fullText.length, tabId },
+  } });
 
   let pos = 1;
   const spans = plans.map((p) => {

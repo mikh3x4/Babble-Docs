@@ -10,8 +10,12 @@ python3 -m http.server 8100   # then open http://localhost:8100
 ## Files
 - `index.html` - The whole UI: landing (sign-in / open doc), first-time setup,
   and the editor view. Served from repo root for GitHub Pages.
-- `static/app.js` - Main app: ProseMirror editor, poll/merge/write sync loop,
-  translation scheduling, comment locks, language + cost UI.
+- `static/app.js` - UI shell: ProseMirror editor, blocks<->PM conversion,
+  decoration plugin, views (landing/setup/editor), wiring to the engine.
+- `static/sync.js` - The sync engine (createEngine): model derivation, poll
+  loop, serialized revision-conditioned writes, appProperties locks,
+  translation scheduling, Claude conflict merge, and buildMarks (the single
+  source of highlight state). Knows nothing about ProseMirror.
 - `static/core.js` - Pure logic: sanitizer, sentence split, LCS diff,
   `planSentenceUpdates`, `mergeBlocks`, `renderBlocks`.
 - `static/docmodel.js` - Blocks <-> Google Docs conversion: `babel:meta` JSON
