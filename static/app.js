@@ -274,6 +274,7 @@ const pendingPlugin = new Plugin({
           };
           push(m.sentsIn, "pending");
           push(m.sentsOut, "outgoing");
+          push(m.sentsEditing, "editing");
           for (const off of m.ins || []) {
             decos.push(Decoration.widget(base + Math.min(off, max), gapWidget, { side: -1 }));
           }
@@ -401,9 +402,12 @@ function updateCost() {
 }
 
 function updateTranslating() {
-  let any = lockedSids.size > 0;
-  if (!any && model) {
-    for (const s of model.sents.values()) if (s.pending?.length) { any = true; break; }
+  let any = false;
+  if (model) {
+    for (const sid of lockedSids) if (model.sents.has(sid)) { any = true; break; }
+    if (!any) {
+      for (const s of model.sents.values()) if (s.pending?.length) { any = true; break; }
+    }
   }
   els.translating.hidden = !any;
 }
@@ -414,17 +418,20 @@ function decorationInput(blocks) {
   // being translated outward; ins = placeholders for untranslated inserts.
   const map = new Map();
   for (const b of blocks) {
-    const sentsIn = [], sentsOut = [], ins = [];
+    const sentsIn = [], sentsOut = [], sentsEditing = [], ins = [];
     for (const pc of b.pieces || []) {
       if (pc.gap) { ins.push(pc.at); continue; }
       const s = model.sents.get(pc.sid);
       const locked = lockedSids.has(pc.sid);
       const out = pc.outgoing || (locked && s?.source === lang);
       const inc = pc.pending || (locked && s?.source !== lang);
-      if (out) sentsOut.push([pc.start, pc.end]);
+      if (out && translateTimers.has(pc.sid)) sentsEditing.push([pc.start, pc.end]); // waiting for you to finish
+      else if (out) sentsOut.push([pc.start, pc.end]);
       else if (inc) sentsIn.push([pc.start, pc.end]);
     }
-    if (sentsIn.length || sentsOut.length || ins.length) map.set(b.id, { sentsIn, sentsOut, ins });
+    if (sentsIn.length || sentsOut.length || sentsEditing.length || ins.length) {
+      map.set(b.id, { sentsIn, sentsOut, sentsEditing, ins });
+    }
   }
   return map;
 }
@@ -513,6 +520,15 @@ function sendUpdate() {
   const intents = { lang, structural, newParas, removed: merge.removed };
   currentIntents = intents;
   const { dirtySids, plan } = applyIntents(model, intents);
+  for (const sid of merge.removed) {
+    // A dirty sentence that got deleted would otherwise pin its lock (and
+    // everyone's "Translating…" badge) until the TTL.
+    clearTimeout(translateTimers.get(sid));
+    translateTimers.delete(sid);
+    lastEditAt.delete(sid);
+    if (heldLocks.has(sid)) releaseLock(sid);
+  }
+  for (const sid of dirtySids) lastEditAt.set(sid, Date.now());
 
   for (const b of blocks) {
     lastReceived.set(b.id, {
@@ -883,7 +899,8 @@ function queueWrite(plan, metaChanged, intents) {
           }
           break;
         } catch (err) {
-          if (attempt >= 2) throw err;
+          if (attempt >= 4) throw err;
+          await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
           await refreshSnapshot();
           const metaTab = D.findMetaTab(docSnapshot);
           const cfg = metaTab ? D.parseMeta(metaTab) : null;
@@ -1032,12 +1049,20 @@ async function pullDoc() {
   if (!model.languages.some((l) => l.code === lang)) {
     lang = model.languages[0]?.code;
   }
-  if (repairs && canEdit && !queuedWrites && !hasUnsentChanges()) {
+  // Defer repairs while another client is mid-flight (its locks are live) —
+  // competing full rewrites are what turn into revision-conflict storms.
+  if (repairs && canEdit && !queuedWrites && !hasUnsentChanges() && !lockedSids.size) {
     queueWrite({ full: true }, false);
   }
-  // Anything stale (external edit, dead translator, new language): translate.
+  // Pick up stale sentences (external edit, dead translator, new language) —
+  // but slowly, and never ones another client is already translating: the
+  // editing client schedules its own work at 1s and should win.
   if (canEdit && model.apiKey && !queuedWrites) {
-    for (const [sid, s] of model.sents) if (s.pending?.length) scheduleTranslate(sid);
+    for (const [sid, s] of model.sents) {
+      if (s.pending?.length && !lockedSids.has(sid) && !heldLocks.has(sid)) {
+        scheduleTranslate(sid, 4000);
+      }
+    }
   }
 
   applyRemote(renderView(model, lang));
@@ -1151,17 +1176,41 @@ function scanLocks(appProperties) {
 
 // --- Translation (per sentence) --------------------------------------------------------
 
-function scheduleTranslate(sid) {
+const lastEditAt = new Map(); // sid -> last local edit timestamp
+
+function scheduleTranslate(sid, delay = 1000) {
   if (!canEdit) return;
   if (!model?.apiKey) { toast("No Anthropic API key in babel:meta — translations are paused", true); return; }
   clearTimeout(translateTimers.get(sid));
   translateTimers.set(sid, setTimeout(() => {
     translateTimers.delete(sid);
+    applyLocalModel(); // green (waiting) -> blue (translating)
     translateSid(sid).catch((err) => {
       console.error(err);
       toast(`Translation failed: ${err.message}`, true);
     });
-  }, 1000));
+  }, delay));
+}
+
+function cursorInSid(sid) {
+  // Is the local cursor inside this sentence (in the current view)?
+  if (!view || !model) return false;
+  const para = model.paras.find((p) => p.sids.includes(sid));
+  if (!para) return false;
+  const b = renderView(model, lang).find((x) => x.id === para.pid);
+  const pc = b?.pieces.find((x) => x.sid === sid && !x.gap);
+  if (!pc) return false;
+  const { head } = view.state.selection;
+  const $head = view.state.doc.resolve(head);
+  for (let d = $head.depth; d > 0; d--) {
+    const node = $head.node(d);
+    if (ID_TYPES.has(node.type.name) && node.attrs.id) {
+      let offset = head - $head.start(d);
+      if (node.type.name === "list_item") offset -= 1; // inner paragraph token
+      return node.attrs.id === para.pid && offset >= pc.start && offset <= pc.end;
+    }
+  }
+  return false;
 }
 
 function paraContext(pid, srcLang) {
@@ -1175,6 +1224,14 @@ function paraContext(pid, srcLang) {
 async function translateSid(sid) {
   const s = model?.sents.get(sid);
   if (!s || !s.pending?.length) return;
+  // Still writing? (cursor inside the sentence, edited <5s ago) — wait, so
+  // one translation fires when the user is done instead of several.
+  if (s.source === lang && cursorInSid(sid) &&
+      Date.now() - (lastEditAt.get(sid) || 0) < 5000) {
+    scheduleTranslate(sid, 1500);
+    applyLocalModel();
+    return;
+  }
   if (!(await acquireLock(sid))) return; // another client is on it
   try {
     const source = s.source;

@@ -139,6 +139,11 @@ body {
   background: #dbeafe; border-radius: 3px;
   transition: background .4s;
 }
+/* You're still writing this sentence — translation fires when you're done. */
+.ProseMirror .editing {
+  background: #dcfce7; border-radius: 3px;
+  transition: background .4s;
+}
 /* Placeholder where newly added text will appear once translated. */
 .ProseMirror .incoming-gap {
   background: #fef3c7; border-radius: 3px; padding: 0 10px; margin: 0 2px;
