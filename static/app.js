@@ -16,11 +16,9 @@ import {
 } from "./vendor/prosemirror.js";
 
 import * as G from "./gdocs.js";
-import * as T from "./translate.js";
-import {
-  LANGUAGE_CATALOG, newId, escapeHtml, sanitizeInlineHtml, stripTags,
-  mergeBlocks, renderBlocks, blockContext, diffSentenceIndices, sentencePlainOffsets,
-} from "./core.js";
+import { verifyApiKey } from "./translate.js";
+import { createEngine } from "./sync.js";
+import { LANGUAGE_CATALOG, newId, escapeHtml } from "./core.js";
 
 // --- Schema -----------------------------------------------------------------
 
