@@ -149,12 +149,12 @@ export function diffOpcodes(a, b) {
 export function computeSentenceMerge(oldSents, newSents) {
   // Assign sentence ids to an edited sentence list by diffing against the
   // previous one. oldSents: [{sid, html}]; newSents: [{pid, html}].
-  // Equal sentences (ignoring trailing whitespace) keep their id; edited
-  // ones reuse the id they replace pairwise (so a sentence being typed in
-  // keeps a stable id); surplus new ones get fresh ids; missing ones are
-  // removed. sepOnly marks a trailing-whitespace-only change (write it, but
-  // don't retranslate).
-  const norm = (h) => String(h ?? "").replace(/\s+$/, "");
+  // Equal sentences (ignoring surrounding whitespace — separators shuffle
+  // when paragraphs split/merge) keep their id; edited ones reuse the id they
+  // replace pairwise (so a sentence being typed in keeps a stable id);
+  // surplus new ones get fresh ids; missing ones are removed. sepOnly marks
+  // a whitespace-only change (write it, but don't retranslate).
+  const norm = (h) => String(h ?? "").trim();
   const a = oldSents.map((s) => norm(s.html));
   const b = newSents.map((s) => norm(s.html));
   const out = newSents.map((s) => ({ ...s, sid: null, changed: false, sepOnly: false }));

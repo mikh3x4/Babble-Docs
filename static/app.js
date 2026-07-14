@@ -1204,6 +1204,12 @@ async function translateSid(sid) {
       updateCost();
       return;
     }
+    // The model returns a bare sentence; re-attach the source sentence's
+    // trailing whitespace so sentences don't glue together in the target
+    // paragraph. If the source has none (CJK) but the target ends in ASCII
+    // punctuation and isn't last in its paragraph, add a space.
+    const srcTrailing = (srcHtml.match(/\s*$/) || [""])[0];
+    const isLast = para.sids[para.sids.length - 1] === sid;
     const errors = [];
     const plans = {};
     targets.forEach((t, i) => {
@@ -1211,7 +1217,10 @@ async function translateSid(sid) {
       if (r.status === "rejected") {
         errors.push(`${langName(t)}: ${r.reason?.message || r.reason}`);
       } else {
-        cur.content[t] = sanitizeInlineHtml(r.value);
+        const clean = sanitizeInlineHtml(r.value).replace(/\s+$/, "");
+        let sep = srcTrailing;
+        if (!sep && !isLast && /[.!?"')\]]$/.test(stripTags(clean))) sep = " ";
+        cur.content[t] = clean + sep;
         cur.pending = (cur.pending || []).filter((p) => p !== t);
         (plans[t] = plans[t] || new Set()).add(para.pid);
       }
